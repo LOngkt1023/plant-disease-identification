@@ -50,7 +50,6 @@ from tenacity import (
     retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
-    wait_exponential_jitter,
 )
 from tqdm import tqdm
 import hashlib
@@ -463,11 +462,6 @@ SEE_MORE_SELECTORS = [
 
 # ── Hàm tiện ích nhỏ ──────────────────────────────────────────────────────────
 
-def jitter(min_s: float = 1.0, max_s: float = 3.0) -> float:
-    """Trả về độ trễ ngẫu nhiên (giây) để mô phỏng hành vi con người."""
-    return random.uniform(min_s, max_s)
-
-
 def random_ua() -> str:
     """Chọn ngẫu nhiên một User-Agent từ danh sách có sẵn."""
     return random.choice(USER_AGENTS)
@@ -816,7 +810,7 @@ def run_async(coro):
 
 @retry(
     stop=stop_after_attempt(5),
-    wait=wait_exponential_jitter(multiplier=1, min=2, max=10),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
     retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS),
 )
 def fetch_image_urls_with_selenium(
@@ -854,14 +848,14 @@ def fetch_image_urls_with_selenium(
         driver = uc.Chrome(options=options, version_main=None)
         driver.set_page_load_timeout(30)  # Timeout 30s để tránh treo
         driver.get(f"https://www.bing.com/images/search?q={quote_plus(query)}")
-        time.sleep(jitter(2, 4))
+        time.sleep(2)
         log.info("Đã tải trang: %s", driver.title)
 
         # Cuộn trang xuống cuối để kích hoạt lazy-load ảnh
         last_height = driver.execute_script("return document.body.scrollHeight")
         for scroll_idx in range(40):
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(jitter(1.5, 2.5))
+            time.sleep(1.5)
 
             # Nút "Xem thêm" là tùy chọn — bỏ qua mọi lỗi; đây là tính năng bổ sung
             try:
@@ -870,7 +864,7 @@ def fetch_image_urls_with_selenium(
                         if btn.is_displayed() and btn.is_enabled():
                             btn.click()
                             log.debug("Đã click 'Xem thêm' tại lần cuộn #%d", scroll_idx + 1)
-                            time.sleep(jitter(2, 3))
+                            time.sleep(2)
                             break
             except Exception:
                 pass
@@ -996,7 +990,7 @@ def fetch_image_urls_with_selenium(
 
 @retry(
     stop=stop_after_attempt(5),
-    wait=wait_exponential_jitter(multiplier=1, min=2, max=10),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
     retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS),
 )
 async def fetch_image_urls_with_nodriver(
@@ -1033,12 +1027,12 @@ async def fetch_image_urls_with_nodriver(
     try:
         browser = await nd.start(browser_args=browser_args)
         page = await browser.get(f"https://www.bing.com/images/search?q={quote_plus(query)}")
-        await page.wait(jitter(2.0, 4.0))
+        await page.wait(2.0)
 
         # Cuộn trang để kích hoạt lazy-load ảnh (giống logic selenium)
         for _ in range(15):
             await page.scroll_down(300)
-            await page.wait(jitter(0.8, 1.5))
+            await page.wait(0.8)
 
         # Thử click nút "Xem thêm" nếu có
         try:
@@ -1047,7 +1041,7 @@ async def fetch_image_urls_with_nodriver(
                     btn = await page.find(selector)
                     if btn:
                         await btn.click()
-                        await page.wait(jitter(1.5, 2.5))
+                        await page.wait(1.5)
                         log.debug("Nodriver: đã click nút 'Xem thêm' với selector '%s'", selector)
                         break
                 except Exception:
@@ -1113,109 +1107,14 @@ async def fetch_image_urls_with_nodriver(
     return urls_with_meta
 
 
-# Note: Flickr support removed — use Bing and Pinterest sources only.
-
-
-# ── Thu thập URL — Pinterest (Selenium) ──────────────────────────────────────
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential_jitter(multiplier=1, min=2, max=5),
-    retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS),
-)
-def fetch_image_urls_with_pinterest(
-    query: str,
-    max_results: int = 100,
-    headless: bool = True,
-    use_proxy: bool = False,
-) -> List[Tuple[str, Dict]]:
-    """
-    Cào URL ảnh từ Pinterest thông qua Selenium.
-    
-    Lưu ý: Pinterest sử dụng JavaScript động, nên cần thời gian chờ lâu hơn.
-    Lọc ảnh theo kích thước để tránh lấy thumbnail.
-    """
-    urls_with_meta: List[Tuple[str, Dict]] = []
-    driver = None
-    proxy: Optional[str] = proxy_pool.get() if use_proxy else None
-    
-    try:
-        options = uc.ChromeOptions()
-        if headless:
-            options.add_argument("--headless")
-        if proxy:
-            options.add_argument(f"--proxy-server={proxy}")
-            log.info("Pinterest crawler đang sử dụng proxy: %s", proxy)
-        
-        options.add_argument(f"--user-agent={random_ua()}")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        
-        driver = uc.Chrome(options=options, version_main=None)
-        driver.set_page_load_timeout(30)  # Timeout 30s để tránh treo
-        driver.get(f"https://www.pinterest.com/search/pins/?q={quote_plus(query)}")
-        time.sleep(jitter(3, 5))
-        
-        log.info("Đã tải Pinterest: %s", driver.title)
-        
-        # Cuộn trang để tải thêm ảnh (Pinterest lazy-load mạnh)
-        for scroll_idx in range(30):
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(jitter(1.5, 2.5))
-            
-            if len(urls_with_meta) >= max_results:
-                break
-        
-        # Trích xuất URL ảnh từ các phần tử img
-        try:
-            img_elements = driver.find_elements(By.CSS_SELECTOR, "img[data-test-id='organic-pin']")
-            log.info("Pinterest tìm thấy %d phần tử ảnh", len(img_elements))
-            
-            for img in img_elements[:max_results * 2]:
-                if len(urls_with_meta) >= max_results:
-                    break
-                try:
-                    src = img.get_attribute("src")
-                    # Loại bỏ URL thumbnail (chứa 'originals' hoặc '236x')
-                    if src and "pinterest" in src and ("236x" not in src) and src.startswith("http"):
-                        # Cố gắng lấy URL kích thước lớn
-                        src = src.replace("/236x/", "/600x/")
-                        
-                        urls_with_meta.append((src, {
-                            "source": "pinterest_selenium",
-                            "query": query,
-                            "timestamp": datetime.now().isoformat(),
-                            "url": src,
-                            "proxy_used": proxy or "Direct",
-                        }))
-                except Exception:
-                    continue
-        except Exception as exc:
-            log.warning("Lỗi trích xuất Pinterest: %s", exc)
-        
-        log.info("Pinterest tổng số URL thu được: %d", len(urls_with_meta))
-        
-    except Exception as exc:
-        log.warning("Lỗi Pinterest: %s", exc)
-        if proxy:
-            proxy_pool.remove(proxy)
-        raise
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
-    
-    return urls_with_meta
+# Note: Flickr support removed — use Bing only.
 
 
 # ── Tải ảnh xuống ─────────────────────────────────────────────────────────────
 
 @retry(
     stop=stop_after_attempt(3),
-    wait=wait_exponential_jitter(multiplier=1, min=1, max=5),
+    wait=wait_exponential(multiplier=1, min=1, max=5),
     retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS),
 )
 def _download_image_core(
@@ -1454,8 +1353,6 @@ def count_available_urls(
     
     Lưu ý: 
     - Bing: lấy từ HTML, có thể không chính xác 100% nhưng gần thực tế
-    - Flickr: dùng API, chính xác hơn
-    - Pinterest: scroll và đếm, chậm hơn
     
     Trả về: Số lượng ảnh estimate (có thể lấy được), hoặc -1 nếu lỗi
     """
@@ -1473,7 +1370,7 @@ def count_available_urls(
                 driver = uc.Chrome(options=options, version_main=None)
                 driver.set_page_load_timeout(30)  # Timeout 30s để tránh treo
                 driver.get(f"https://www.bing.com/images/search?q={quote_plus(query)}")
-                time.sleep(jitter(1.5, 2.5))
+                time.sleep(1.5)
                 
                 # Scroll để tải thêm ảnh
                 count = 0
@@ -1499,43 +1396,7 @@ def count_available_urls(
                     except:
                         pass
         
-        elif platform.lower() == "flickr":
-            session = _get_session()
-            try:
-                params = {
-                    "method": "flickr.photos.search",
-                    "api_key": FLICKR_API_KEY,
-                    "text": query,
-                    "per_page": 1,
-                    "format": "json",
-                    "nojsoncallback": 1,
-                }
-                headers = {"User-Agent": random_ua()}
-                
-                if session:
-                    resp = session.get(
-                        "https://www.flickr.com/services/rest/",
-                        params=params,
-                        timeout=15,
-                        headers=headers
-                    )
-                else:
-                    # Fallback urllib
-                    raise ImportError("requests not available, skip Flickr count")
-                
-                data = resp.json()
-                if data.get("stat") == "ok":
-                    total = int(data["photos"].get("total", 0))
-                    return min(total, max_check)
-                return -1
-                
-            except Exception as exc:
-                log.warning("Không thể đếm Flickr URLs: %s", exc)
-                return -1
-        
-        elif platform.lower() == "pinterest":
-            # Pinterest khó đếm chính xác → return estimate
-            return 100  # Estimate mặc định cho Pinterest
+        # Flickr support removed — do not attempt to count via Flickr API
         
         else:
             return -1
@@ -1561,16 +1422,16 @@ def crawl_class_stealth(
     """
     Thu thập hình ảnh cho một lớp bệnh cây trồng cụ thể từ nhiều nền tảng.
 
-    Tính năng:
-      - Tự động tiếp tục từ điểm dừng nếu đã có ảnh/metadata từ lần trước.
-      - Ghi metadata JSONL ngay sau mỗi ảnh tải thành công (an toàn khi sập).
-      - Lọc URL trùng lặp qua seen_urls (áp dụng cho TẤT CẢ truy vấn của lớp này).
-      - Số thứ tự file được đếm liên tục, nguyên tử qua các vòng lặp truy vấn.
-      - Hỗ trợ nhiều nền tảng: Bing, Flickr, Pinterest.
-      - ThreadPoolExecutor chạy song song tải xuống ảnh (tác vụ I/O-bound).
+        Tính năng:
+            - Tự động tiếp tục từ điểm dừng nếu đã có ảnh/metadata từ lần trước.
+            - Ghi metadata JSONL ngay sau mỗi ảnh tải thành công (an toàn khi sập).
+            - Lọc URL trùng lặp qua seen_urls (áp dụng cho TẤT CẢ truy vấn của lớp này).
+            - Số thứ tự file được đếm liên tục, nguyên tử qua các vòng lặp truy vấn.
+            - Hỗ trợ nền tảng: Bing.
+            - ThreadPoolExecutor chạy song song tải xuống ảnh (tác vụ I/O-bound).
 
     Args:
-        platforms: Danh sách nền tảng cần dùng, ví dụ ["bing", "flickr", "pinterest"].
+        platforms: Danh sách nền tảng cần dùng, ví dụ ["bing"].
                    Mặc định: ["bing"]
 
     Trả về dict gồm: số ảnh đã tải, số lần thử, metadata từng ảnh.
@@ -1666,11 +1527,6 @@ def crawl_class_stealth(
                             query, max_results=max_images * 2,
                             headless=headless, use_proxy=use_proxy_for_browser,
                         )
-                elif platform == "pinterest":
-                    urls_with_meta = fetch_image_urls_with_pinterest(
-                        query, max_results=max_images * 2,
-                        headless=headless, use_proxy=use_proxy_for_browser,
-                    )
                 else:
                     log.warning("Nền tảng không hỗ trợ: %s", platform)
                     continue
@@ -1818,10 +1674,10 @@ def crawl_all_stealth(
     Bỏ qua các lớp không có trong DATASET_CLASSES và ghi cảnh báo.
     
     Args:
-        platforms: Danh sách nền tảng, mặc định: ["bing", "flickr", "pinterest"]
+        platforms: Danh sách nền tảng, mặc định: ["bing"]
     """
     if platforms is None:
-        platforms = ["bing", "pinterest"]
+        platforms = ["bing"]
     
     root = Path(output_root)
     # Tạo trước cấu trúc thư mục dữ liệu
@@ -1910,10 +1766,10 @@ if __name__ == "__main__":
         help="Công cụ thu thập sử dụng: selenium (ổn định hơn) hoặc nodriver (CDP, ít bị phát hiện hơn).",
     )
     parser.add_argument(
-        "--platforms", nargs="+", default=["bing", "pinterest"],
-        help="Danh sách nền tảng cần dùng: bing, pinterest. "
+        "--platforms", nargs="+", default=["bing"],
+        help="Danh sách nền tảng cần dùng: bing. "
              "Lưu ý: ShutterStock là dịch vụ trả phí nên không hỗ trợ crawl công khai. "
-             "(Mặc định: bing pinterest)",
+             "(Mặc định: bing)",
     )
     parser.add_argument(
         "--use-proxy-browser", action="store_true",
@@ -1935,7 +1791,7 @@ if __name__ == "__main__":
 
     # Chuẩn hóa tên nền tảng
     platforms = [p.lower() for p in args.platforms]
-    valid_platforms = ["bing", "pinterest"]
+    valid_platforms = ["bing"]
     invalid = [p for p in platforms if p not in valid_platforms]
     if invalid:
         log.warning("Nền tảng không hỗ trợ (bỏ qua): %s. Hỗ trợ: %s", invalid, valid_platforms)
