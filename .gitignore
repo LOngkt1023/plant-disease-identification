@@ -1,0 +1,52 @@
+# ── Dữ liệu ảnh (kích thước lớn — không đưa lên GitHub) ──────────────────────
+data/raw/
+data/processed/
+data/augmented/
+
+# ── Trọng số mô hình đã huấn luyện ───────────────────────────────────────────
+models/*.pt
+models/*.pth
+models/*.ckpt
+models/*.h5
+
+# ── Python cache ──────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.pytest_cache/
+
+# ── Jupyter Notebook checkpoints ─────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ── Môi trường ảo Python ─────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── IDE / Editor ─────────────────────────────────────────────────────────────
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Hệ điều hành ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Log & temp files ─────────────────────────────────────────────────────────
+*.log
+*.tmp
+_tmp_*.jpg
+
+# ── Chromium / undetected_chromedriver cache ──────────────────────────────────
+undetected_chromedriver/
+
+# ── Biến môi trường & secrets ────────────────────────────────────────────────
+.env
+.env.*
+secrets.json

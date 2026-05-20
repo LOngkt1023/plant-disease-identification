@@ -1,0 +1,17 @@
+selenium
+undetected-chromedriver
+tenacity
+requests
+requests_html
+matplotlib
+seaborn
+pandas
+scikit-learn
+Pillow
+opencv-python
+albumentations
+torch
+torchvision
+jupyter
+tqdm
+nodriver
