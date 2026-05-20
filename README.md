@@ -4,7 +4,22 @@
 
 ---
 
-## 📑 Mục lục
+## � **PHIÊN BẢN 2.2 - SECURITY BUILD** (Cập nhật)
+
+**Phiên bản v2.2** bao gồm các sửa lỗi lõi và tối ưu hóa:
+
+| Cải Tiến | Trạng Thái | Chi Tiết |
+|----------|-----------|---------|
+| **Atomic File Naming** | ✅ Sửa | Loại bỏ lỗ hổng chỉ số khi download thất bại |
+| **Loại bỏ numpy** | ✅ Sửa | PIL thuần, không phụ thuộc numpy |
+| **Driver Timeout** | ✅ Bổ sung | 30s timeout cho `driver.get()` |
+| **Resume Chính Xác** | ✅ Sửa | Cập nhật next_file_idx từ file_counter |
+
+**📖 Chi tiết:** Xem [FIXES_V2.2.md](./FIXES_V2.2.md) và [TESTING_V2.2.md](./TESTING_V2.2.md)
+
+---
+
+## �📑 Mục lục
 1. [Sơ đồ Cấu trúc Toàn diện Dự án](#1-sơ-đồ-cấu-trúc-toàn-diện-dự-án)
 2. [Quy tắc Cơ bản & Phân nhiệm của các Notebooks (`notebooks/`)](#2-quy-tắc-cơ-bản--phân-nhiệm-của-các-notebooks-notebooks)
 3. [Quy trình Phát triển Hệ thống (Development Workflow)](#3-quy-trình-phát-triển-hệ-thống-development-workflow)

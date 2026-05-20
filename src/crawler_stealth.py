@@ -14,16 +14,18 @@ Các cải tiến trong phiên bản này:
 
 import json
 import logging
+import os
 import random
+import re
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, unquote
 import urllib.error
 import urllib.request
 
@@ -48,8 +50,17 @@ from tenacity import (
     retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
+    wait_exponential_jitter,
 )
 from tqdm import tqdm
+import hashlib
+
+try:
+    import curl_cffi.requests as cffi_requests  # type: ignore
+    CURL_CFFI_AVAILABLE = True
+except ImportError:
+    CURL_CFFI_AVAILABLE = False
+    log.debug("curl_cffi chưa cài đặt — sẽ dùng requests thông thường (có thể bị chặn TLS).")
 
 try:
     import undetected_chromedriver as uc
@@ -80,6 +91,9 @@ RETRYABLE_EXCEPTIONS = (
 MIN_IMAGE_WIDTH  = 100  # pixel
 MIN_IMAGE_HEIGHT = 100  # pixel
 
+# (Flickr support removed) - Flickr API key and fetch function removed to simplify
+# the scraping stack and avoid rate-limited public API usage.
+
 DATASET_CLASSES: Dict[str, str] = {
     "Rice_Healthy":    "La lua khoe manh",
     "Rice_Blast":      "La lua benh dao on",
@@ -94,16 +108,340 @@ DATASET_CLASSES: Dict[str, str] = {
 }
 
 SEARCH_QUERIES: Dict[str, List[str]] = {
-    "Rice_Healthy":    ["healthy rice leaf", "rice plant healthy"],
-    "Rice_Blast":      ["rice blast disease leaf"],
-    "Rice_Blight":     ["rice bacterial blight leaf"],
-    "Coffee_Healthy":  ["healthy coffee leaf"],
-    "Coffee_Rust":     ["coffee leaf rust disease"],
-    "Tomato_Healthy":  ["healthy tomato leaf"],
-    "Tomato_Blight":   ["tomato late blight leaf"],
-    "Tomato_Curl":     ["tomato leaf curl virus"],
-    "Citrus_Canker":   ["citrus canker disease leaf"],
-    "Citrus_Greening": ["citrus greening huanglongbing leaf"],
+    # Nhàn nẹ lại: mỗi lớp có từ khóa nhiều ngôn ngữ (Tiếng Anh, Tiếng Việt, Tiếng Trung, Tiếng Thái)
+    # Ưu tiên từ khóa "close-up", "single leaf", "macro" để giảm ảnh cảnh đồng, ảnh nhiều lá
+    # CẢI TIẾN: Thêm từ khóa ngách để tránh lá ngô, lá sả, ảnh infographic
+    "Rice_Healthy": [
+        # Tiếng Anh: cận cảnh, single leaf, macro
+        "healthy rice leaf close-up single",
+        "rice plant healthy green leaf macro",
+        "Oryza sativa healthy leaf",
+        "IR64 rice healthy leaf",
+        "jasmine rice green leaf close-up",
+        "paddy rice single leaf macro",
+        # Tiếng Việt: lúa IR64, lúa thơm, lá cây đơn
+        "lú a khỏe mạnh lá cây",
+        "lá lúa IR64 xanh lá cây",
+        "lúa thơm lá lẻ khỏe mạnh",
+        "cận cảnh lá lúa xanh",
+        "lúa Oryza sativa lá đơn",
+        # Tiếng Trung: Oryza sativa, lúa xanh
+        "稻叶 健康 病虫害",
+        "水稻 绿色 叶片 特写",
+        "Oryza sativa 单叶 健康",
+        "稻叶细节 绿色 特写",
+        # Tiếng Thái: ข้าว = lúa
+        "ข้าวสารใบเขียว",
+        "ใบข้าว สุขภาพดี",
+        "ข้าวหอม ใบเดี่ยว สีเขียว",
+    ],
+    "Rice_Blast": [
+        # Tiếng Anh: cận cảnh, single leaf, disease lesion
+        "rice blast disease leaf close-up",
+        "Magnaporthe oryzae rice leaf lesion",
+        "rice blast fungal infection single leaf",
+        "rice blast brown spot macro",
+        "pyricularia oryzae leaf spot",
+        # Tiếng Việt: bệnh đạo ôn, lá lúa
+        "lú a bệnh đạo ôn lá",
+        "bệnh đạo ôn lúa lá cây",
+        "lá lúa bệnh nâu",
+        "cận cảnh lá lúa bệnh đạo ôn",
+        # Tiếng Trung: 稻瘟病 (Magnaporthe)
+        "稻瘟病 叶片 特写",
+        "水稻纹枯病 病斑",
+        "Magnaporthe 水稻 叶片",
+        "稻叶 棕色 病斑 特写",
+        # Tiếng Thái: โรคไข้ทองข้าว
+        "โรคไข้ทองข้าว ใบ",
+        "ข้าวบิด พยาธิ",
+        "ข้าว ใบ โรคราในข้าว",
+    ],
+    "Rice_Blight": [
+        # Tiếng Anh: bacterial blight, leaf spot
+        "rice bacterial blight leaf close-up",
+        "Xanthomonas oryzae rice leaf",
+        "rice blight yellowing single leaf",
+        "rice bacterial streak lesion",
+        "bacterial leaf streak rice macro",
+        # Tiếng Việt: bệnh bạc lá, lá lúa
+        "lú a bằc lá bệnh",
+        "lá lúa bệnh bạc lá",
+        "bệnh bạc lá lúa cây",
+        "cận cảnh lá lúa bệnh vàng",
+        # Tiếng Trung: 稻叶枯病 (bacterial blight)
+        "稻叶枯病 叶片",
+        "水稻细菌性条纹病",
+        "白叶枯病 稻 特写",
+        "稻 细菌性 条纹 叶片",
+        # Tiếng Thái: โรคแผลสีขาว
+        "ใบข้าว บาดแผลสีขาว",
+        "ข้าวใบแห้ง",
+        "ข้าว ใบ โรค",
+    ],
+    "Coffee_Healthy": [
+        "healthy coffee leaf single close-up",
+        "Coffea arabica healthy green leaf macro",
+        "coffee plant leaf green isolated",
+        "lá cà phê khỏe mạnh",
+        "咖啡叶 健康 特写",
+        "阿拉比卡咖啡 绿叶",
+        "ใบกาแฟ สีเขียว",
+        "สุขภาพกาแฟ ใบสวย",
+    ],
+    "Coffee_Rust": [
+        "coffee leaf rust disease close-up",
+        "Hemileia vastatrix coffee leaf orange spots",
+        "coffee rust fungus single leaf",
+        "lá cà phê gỉ sắt bệnh",
+        "咖啡叶锈病 橙色斑点",
+        "咖啡铁皮病 特写",
+        "โรคสนิมใบกาแฟ",
+        "ใบกาแฟ โรคแดง",
+    ],
+    "Tomato_Healthy": [
+        "healthy tomato leaf single close-up",
+        "Solanum lycopersicum healthy leaf macro",
+        "tomato plant green leaf isolated",
+        "lá cà chua khỏe mạnh",
+        "番茄叶 健康 绿色",
+        "黄瓜状番茄 无病害",
+        "ใบมะเขือเทศ สดใจ",
+        "มะเขือเทศ ใบสุขภาพดี",
+    ],
+    "Tomato_Blight": [
+        "tomato late blight leaf close-up",
+        "Phytophthora infestans tomato leaf",
+        "tomato blight brown lesion single leaf",
+        "lá cà chua sương mai bệnh",
+        "番茄晚疫病 褐色病斑",
+        "番茄疫病 叶片腐烂",
+        "โรคหนาวเย็นมะเขือเทศ",
+        "ใบมะเขือเทศ สูบเหี่ย",
+    ],
+    "Tomato_Curl": [
+        "tomato leaf curl virus close-up",
+        "TYLCV tomato curled leaf",
+        "tomato leaf curl disease single plant",
+        "lá cà chua xoăn lá bệnh",
+        "番茄卷叶病毒 卷曲",
+        "番茄黄化卷叶病毒 病状",
+        "ไวรัสม้วนใบมะเขือเทศ",
+        "ใบมะเขือเทศ โค้งม้วน",
+    ],
+    "Citrus_Canker": [
+        "citrus canker disease leaf close-up",
+        "Xanthomonas citri citrus leaf lesion",
+        "orange leaf canker spots macro",
+        "lá cam loét bệnh cần",
+        "柑橘溃疡病 叶片病斑",
+        "橙叶 黄色斑点 病害",
+        "โรคแผลสะดือส้ม",
+        "ใบส้ม ฝ้ากรรม",
+    ],
+    "Citrus_Greening": [
+        "citrus greening HLB disease leaf",
+        "Huanglongbing citrus yellow mottled leaf",
+        "citrus greening asymmetric yellowing leaf",
+        "lá cam vàng HLB bệnh",
+        "柑橘黄龙病 黄化叶",
+        "柠檬绿叶病 斑驳",
+        "โรคเหลืองมะกดลิ่ว",
+        "ใบส้มฟาง สีเหลือง",
+    ],
+}
+
+# ── Từ khóa LOẠI TRỪ: lọc ảnh không liên quan (infographic, diagram, other plants) ──
+# Nếu URL hoặc từ khóa tìm kiếm chứa bất kỳ từ khóa nào dưới đây, ảnh sẽ bị bỏ qua
+# CẢNH BÁO: Các từ khóa được thiết kế để dùng word boundary regex (\b...\b)
+#           nên tránh các từ quá ngắn (cỏ, chè) → dùng từ khóa cụ thể hơn (corn, barley, wheat)
+#           Ưu tiên tiếng Anh vì hầu hết URL ảnh trên thế giới dùng tiếng Anh không dấu
+EXCLUDE_KEYWORDS: Dict[str, List[str]] = {
+    # Chung cho tất cả: loại bỏ infographic, diagram, cartoon, vector
+    "common": [
+        "infographic",
+        "diagram", 
+        "cartoon",
+        "chart",
+        "graph",
+        "vector",
+        "illustration",
+        "icon",
+        "emoji",
+        "logo",
+        "animation",
+        "drawing",
+        "sketch",
+        "painting",
+        "artwork",
+        "flower",  # hoa không phải lá bệnh cây trồng
+        "blossom",
+        "petal",
+    ],
+    # LÚA (Rice): loại bỏ ảnh từ ngô, lúa mạch, cà phê, cà chua, cam/quýt, v.v.
+    "Rice_Healthy": [
+        "corn", "maize", "zea_mays",
+        "wheat", "triticum", "barley", "hordeum",
+        "coffee", "coffea", "arabica", "robusta",
+        "tomato", "solanum", "lycopersicum",
+        "citrus", "orange", "lemon", "lime", "mandarin", "tangerine",
+        "cacao", "cocoa", "theobroma",
+        "potato", "solanum_tuberosum",
+        "pepper", "capsicum", "bell_pepper",
+        "eggplant", "aubergine", "brinjal",
+        "cucumber", "cucumis", "melon",
+        "bean", "legume", "fabaceae",
+        "sorghum", "sugarcane", "millet",
+        "sedge", "carex",
+        "cattail", "typha",
+        "reed", "phragmites",
+        "bamboo", "grass_like", "poaceae",
+    ],
+    "Rice_Blast": [
+        "corn", "maize", "zea_mays",
+        "wheat", "triticum", "barley", "hordeum",
+        "coffee", "coffea", "arabica", "robusta",
+        "tomato", "solanum", "lycopersicum",
+        "citrus", "orange", "lemon", "lime", "mandarin", "tangerine",
+        "cacao", "cocoa", "theobroma",
+        "potato", "solanum_tuberosum",
+        "pepper", "capsicum", "bell_pepper",
+        "eggplant", "aubergine", "brinjal",
+        "cucumber", "cucumis", "melon",
+        "bean", "legume", "fabaceae",
+        "sorghum", "sugarcane", "millet",
+        "sedge", "carex",
+        "cattail", "typha",
+        "reed", "phragmites",
+        "bamboo", "grass_like", "poaceae",
+    ],
+    "Rice_Blight": [
+        "corn", "maize", "zea_mays",
+        "wheat", "triticum", "barley", "hordeum",
+        "coffee", "coffea", "arabica", "robusta",
+        "tomato", "solanum", "lycopersicum",
+        "citrus", "orange", "lemon", "lime", "mandarin", "tangerine",
+        "cacao", "cocoa", "theobroma",
+        "potato", "solanum_tuberosum",
+        "pepper", "capsicum", "bell_pepper",
+        "eggplant", "aubergine", "brinjal",
+        "cucumber", "cucumis", "melon",
+        "bean", "legume", "fabaceae",
+        "sorghum", "sugarcane", "millet",
+        "sedge", "carex",
+        "cattail", "typha",
+        "reed", "phragmites",
+        "bamboo", "grass_like", "poaceae",
+    ],
+    # CÀ PHÊ (Coffee): loại bỏ ảnh từ lúa, ngô, cà chua, cam/quýt, v.v.
+    "Coffee_Healthy": [
+        "rice", "oryza", "paddy",
+        "corn", "maize", "zea_mays",
+        "wheat", "triticum", "barley", "hordeum",
+        "tomato", "solanum", "lycopersicum",
+        "citrus", "orange", "lemon", "lime", "mandarin", "tangerine",
+        "cacao", "cocoa", "theobroma",
+        "potato", "solanum_tuberosum",
+        "pepper", "capsicum", "bell_pepper",
+        "eggplant", "aubergine", "brinjal",
+        "cucumber", "cucumis", "melon",
+        "bean", "legume", "fabaceae",
+        "mint", "mentha",
+        "basil", "ocimum",
+        "tea", "camellia", "thea",
+    ],
+    "Coffee_Rust": [
+        "rice", "oryza", "paddy",
+        "corn", "maize", "zea_mays",
+        "wheat", "triticum", "barley", "hordeum",
+        "tomato", "solanum", "lycopersicum",
+        "citrus", "orange", "lemon", "lime", "mandarin", "tangerine",
+        "cacao", "cocoa", "theobroma",
+        "potato", "solanum_tuberosum",
+        "pepper", "capsicum", "bell_pepper",
+        "eggplant", "aubergine", "brinjal",
+        "cucumber", "cucumis", "melon",
+        "bean", "legume", "fabaceae",
+        "mint", "mentha",
+        "basil", "ocimum",
+        "tea", "camellia", "thea",
+    ],
+    # CÀ CHUA (Tomato): loại bỏ ảnh từ lúa, ngô, cà phê, cam/quýt, v.v.
+    "Tomato_Healthy": [
+        "rice", "oryza", "paddy",
+        "corn", "maize", "zea_mays",
+        "wheat", "triticum", "barley", "hordeum",
+        "coffee", "coffea", "arabica", "robusta",
+        "citrus", "orange", "lemon", "lime", "mandarin", "tangerine",
+        "cacao", "cocoa", "theobroma",
+        "eggplant", "aubergine", "brinjal",
+        "cucumber", "cucumis", "melon",
+        "bean", "legume", "fabaceae",
+        "potato", "solanum_tuberosum",
+        "pepper", "capsicum", "bell_pepper", "paprika",
+        "chili", "pimiento",
+    ],
+    "Tomato_Blight": [
+        "rice", "oryza", "paddy",
+        "corn", "maize", "zea_mays",
+        "wheat", "triticum", "barley", "hordeum",
+        "coffee", "coffea", "arabica", "robusta",
+        "citrus", "orange", "lemon", "lime", "mandarin", "tangerine",
+        "cacao", "cocoa", "theobroma",
+        "eggplant", "aubergine", "brinjal",
+        "cucumber", "cucumis", "melon",
+        "bean", "legume", "fabaceae",
+        "potato", "solanum_tuberosum",
+        "pepper", "capsicum", "bell_pepper", "paprika",
+        "chili", "pimiento",
+    ],
+    "Tomato_Curl": [
+        "rice", "oryza", "paddy",
+        "corn", "maize", "zea_mays",
+        "wheat", "triticum", "barley", "hordeum",
+        "coffee", "coffea", "arabica", "robusta",
+        "citrus", "orange", "lemon", "lime", "mandarin", "tangerine",
+        "cacao", "cocoa", "theobroma",
+        "eggplant", "aubergine", "brinjal",
+        "cucumber", "cucumis", "melon",
+        "bean", "legume", "fabaceae",
+        "potato", "solanum_tuberosum",
+        "pepper", "capsicum", "bell_pepper", "paprika",
+        "chili", "pimiento",
+    ],
+    # CAM/QUÝT (Citrus): loại bỏ ảnh từ lúa, ngô, cà phê, cà chua, v.v.
+    "Citrus_Canker": [
+        "rice", "oryza", "paddy",
+        "corn", "maize", "zea_mays",
+        "wheat", "triticum", "barley", "hordeum",
+        "coffee", "coffea", "arabica", "robusta",
+        "tomato", "solanum", "lycopersicum",
+        "cacao", "cocoa", "theobroma",
+        "apple", "malus", "pome",
+        "pear", "pyrus",
+        "plum", "prunus", "stone_fruit",
+        "potato", "solanum_tuberosum",
+        "pepper", "capsicum", "bell_pepper",
+        "eggplant", "aubergine", "brinjal",
+        "cucumber", "cucumis", "melon",
+        "bean", "legume", "fabaceae",
+    ],
+    "Citrus_Greening": [
+        "rice", "oryza", "paddy",
+        "corn", "maize", "zea_mays",
+        "wheat", "triticum", "barley", "hordeum",
+        "coffee", "coffea", "arabica", "robusta",
+        "tomato", "solanum", "lycopersicum",
+        "cacao", "cocoa", "theobroma",
+        "apple", "malus", "pome",
+        "pear", "pyrus",
+        "plum", "prunus", "stone_fruit",
+        "potato", "solanum_tuberosum",
+        "pepper", "capsicum", "bell_pepper",
+        "eggplant", "aubergine", "brinjal",
+        "cucumber", "cucumis", "melon",
+        "bean", "legume", "fabaceae",
+    ],
 }
 
 USER_AGENTS: List[str] = [
@@ -135,6 +473,47 @@ def random_ua() -> str:
     return random.choice(USER_AGENTS)
 
 
+def _should_exclude_url(url: str, query: str, class_name: str) -> bool:
+    """
+    Kiểm tra xem URL/query có chứa từ khóa loại trừ không.
+    
+    Cải tiến:
+      1. Decode URL percent-encoded (ví dụ: %20 → space, %E2 → ký tự Unicode)
+      2. Dùng regex word boundaries (\b) để tránh keyword overlap
+         (ví dụ: "cỏ" không sẽ match "coffee")
+      3. Case-insensitive comparison
+    
+    Trả về True nếu URL/query nên bị loại bỏ.
+    """
+    try:
+        # Decode URL percent-encoded (ví dụ: %20 thành space, %E2 thành ký tự Unicode)
+        decoded_url = unquote(url)
+    except Exception:
+        decoded_url = url
+    
+    combined_text = f"{decoded_url} {query}".lower()
+    
+    # Kiểm tra từ khóa loại trừ chung
+    common_exclude = EXCLUDE_KEYWORDS.get("common", [])
+    for keyword in common_exclude:
+        keyword_lower = keyword.lower()
+        # Dùng word boundary regex để tránh false positives
+        # Ví dụ: "cỏ" không match "coffee", nhưng match "cỏ dại"
+        pattern = r'\b' + re.escape(keyword_lower) + r'\b'
+        if re.search(pattern, combined_text):
+            return True
+    
+    # Kiểm tra từ khóa loại trừ riêng cho lớp cây này
+    class_exclude = EXCLUDE_KEYWORDS.get(class_name, [])
+    for keyword in class_exclude:
+        keyword_lower = keyword.lower()
+        pattern = r'\b' + re.escape(keyword_lower) + r'\b'
+        if re.search(pattern, combined_text):
+            return True
+    
+    return False
+
+
 def _cleanup_temp_files(class_dir: Path) -> None:
     """Xóa các file tạm `_tmp_*.jpg` còn sót lại từ lần chạy bị gián đoạn trước."""
     for tmp in class_dir.glob("_tmp_*.jpg"):
@@ -143,6 +522,50 @@ def _cleanup_temp_files(class_dir: Path) -> None:
             log.debug("Đã xóa file tạm còn sót: %s", tmp.name)
         except Exception as exc:
             log.warning("Không thể xóa file tạm %s: %s", tmp.name, exc)
+
+
+def _compute_image_hash(img_path: Path) -> Optional[str]:
+    """
+    Tính MD5 hash của ảnh để phát hiện ảnh trùng lặp.
+    
+    Trả về hash string (dạng hex), hoặc None nếu lỗi.
+    """
+    try:
+        with open(img_path, "rb") as f:
+            return hashlib.md5(f.read()).hexdigest()
+    except Exception as exc:
+        log.debug("Không thể tính hash cho %s: %s", img_path.name, exc)
+        return None
+
+
+def _load_image_hashes(class_dir: Path) -> Set[str]:
+    """
+    Tải tập hợp các hash ảnh đã có sẵn.
+    Dùng để phát hiện và loại bỏ ảnh trùng lặp từ các URL khác nhau.
+    """
+    hashes: Set[str] = set()
+    meta_path = class_dir / "metadata.jsonl"
+    
+    if not meta_path.exists():
+        return hashes
+    
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    # Nếu metadata chứa hash, tải vào tập hợp
+                    if "image_hash" in entry:
+                        hashes.add(entry["image_hash"])
+                except json.JSONDecodeError:
+                    continue
+    except Exception as exc:
+        log.warning("Lỗi tải image hashes: %s", exc)
+    
+    return hashes
 
 
 # ── Cơ chế Resume: đọc trạng thái đã tải ─────────────────────────────────────
@@ -329,10 +752,30 @@ _thread_local = threading.local()
 
 def _get_session():
     """
-    Trả về requests.Session cho luồng hiện tại.
-    Mỗi luồng có một session riêng để tận dụng connection pooling mà không bị xung đột.
-    Nếu requests chưa được cài đặt, trả về None (sẽ fallback về urllib).
+    Trả về session HTTP cho luồng hiện tại.
+    
+    Ưu tiên: curl_cffi (TLS fingerprinting Chrome) → requests → None (urllib fallback)
+    - curl_cffi: Giả mạo chữ ký TLS của Chrome, vượt qua Cloudflare/Anti-bot tốt hơn
+    - requests: Thư viện HTTP chuẩn, nhanh nhưng dễ bị phát hiện TLS
+    - urllib: Fallback cuối cùng, rất chậm
     """
+    # Thử curl_cffi trước (TLS fingerprinting tốt nhất)
+    if CURL_CFFI_AVAILABLE:
+        if not hasattr(_thread_local, "cffi_session"):
+            try:
+                # Tạo session curl_cffi với Browser Fingerprint của Chrome 120
+                session = cffi_requests.Session(
+                    impersonate="chrome120",  # Giả mạo Chrome 120
+                )
+                _thread_local.cffi_session = session
+                log.debug("Session curl_cffi (Chrome 120 impersonate) được tạo")
+                return session
+            except Exception as exc:
+                log.debug("Không thể tạo curl_cffi session: %s, falling back to requests", exc)
+        else:
+            return _thread_local.cffi_session
+    
+    # Fallback: requests thường
     try:
         import requests  # type: ignore
     except ImportError:
@@ -342,6 +785,7 @@ def _get_session():
         session = requests.Session()
         session.headers.update({"User-Agent": random_ua()})
         _thread_local.session = session
+        log.debug("Session requests được tạo")
     return _thread_local.session
 
 
@@ -372,7 +816,7 @@ def run_async(coro):
 
 @retry(
     stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
+    wait=wait_exponential_jitter(multiplier=1, min=2, max=10),
     retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS),
 )
 def fetch_image_urls_with_selenium(
@@ -408,6 +852,7 @@ def fetch_image_urls_with_selenium(
         options.add_argument("--disable-blink-features=AutomationControlled")
 
         driver = uc.Chrome(options=options, version_main=None)
+        driver.set_page_load_timeout(30)  # Timeout 30s để tránh treo
         driver.get(f"https://www.bing.com/images/search?q={quote_plus(query)}")
         time.sleep(jitter(2, 4))
         log.info("Đã tải trang: %s", driver.title)
@@ -538,7 +983,6 @@ def fetch_image_urls_with_selenium(
         log.info("Tổng số URL đã thu thập được: %d", len(urls_with_meta))
 
     finally:
-        # Luôn đóng trình duyệt dù có lỗi hay không
         if driver:
             try:
                 driver.quit()
@@ -552,7 +996,7 @@ def fetch_image_urls_with_selenium(
 
 @retry(
     stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
+    wait=wait_exponential_jitter(multiplier=1, min=2, max=10),
     retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS),
 )
 async def fetch_image_urls_with_nodriver(
@@ -669,11 +1113,109 @@ async def fetch_image_urls_with_nodriver(
     return urls_with_meta
 
 
+# Note: Flickr support removed — use Bing and Pinterest sources only.
+
+
+# ── Thu thập URL — Pinterest (Selenium) ──────────────────────────────────────
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential_jitter(multiplier=1, min=2, max=5),
+    retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS),
+)
+def fetch_image_urls_with_pinterest(
+    query: str,
+    max_results: int = 100,
+    headless: bool = True,
+    use_proxy: bool = False,
+) -> List[Tuple[str, Dict]]:
+    """
+    Cào URL ảnh từ Pinterest thông qua Selenium.
+    
+    Lưu ý: Pinterest sử dụng JavaScript động, nên cần thời gian chờ lâu hơn.
+    Lọc ảnh theo kích thước để tránh lấy thumbnail.
+    """
+    urls_with_meta: List[Tuple[str, Dict]] = []
+    driver = None
+    proxy: Optional[str] = proxy_pool.get() if use_proxy else None
+    
+    try:
+        options = uc.ChromeOptions()
+        if headless:
+            options.add_argument("--headless")
+        if proxy:
+            options.add_argument(f"--proxy-server={proxy}")
+            log.info("Pinterest crawler đang sử dụng proxy: %s", proxy)
+        
+        options.add_argument(f"--user-agent={random_ua()}")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        
+        driver = uc.Chrome(options=options, version_main=None)
+        driver.set_page_load_timeout(30)  # Timeout 30s để tránh treo
+        driver.get(f"https://www.pinterest.com/search/pins/?q={quote_plus(query)}")
+        time.sleep(jitter(3, 5))
+        
+        log.info("Đã tải Pinterest: %s", driver.title)
+        
+        # Cuộn trang để tải thêm ảnh (Pinterest lazy-load mạnh)
+        for scroll_idx in range(30):
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(jitter(1.5, 2.5))
+            
+            if len(urls_with_meta) >= max_results:
+                break
+        
+        # Trích xuất URL ảnh từ các phần tử img
+        try:
+            img_elements = driver.find_elements(By.CSS_SELECTOR, "img[data-test-id='organic-pin']")
+            log.info("Pinterest tìm thấy %d phần tử ảnh", len(img_elements))
+            
+            for img in img_elements[:max_results * 2]:
+                if len(urls_with_meta) >= max_results:
+                    break
+                try:
+                    src = img.get_attribute("src")
+                    # Loại bỏ URL thumbnail (chứa 'originals' hoặc '236x')
+                    if src and "pinterest" in src and ("236x" not in src) and src.startswith("http"):
+                        # Cố gắng lấy URL kích thước lớn
+                        src = src.replace("/236x/", "/600x/")
+                        
+                        urls_with_meta.append((src, {
+                            "source": "pinterest_selenium",
+                            "query": query,
+                            "timestamp": datetime.now().isoformat(),
+                            "url": src,
+                            "proxy_used": proxy or "Direct",
+                        }))
+                except Exception:
+                    continue
+        except Exception as exc:
+            log.warning("Lỗi trích xuất Pinterest: %s", exc)
+        
+        log.info("Pinterest tổng số URL thu được: %d", len(urls_with_meta))
+        
+    except Exception as exc:
+        log.warning("Lỗi Pinterest: %s", exc)
+        if proxy:
+            proxy_pool.remove(proxy)
+        raise
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+    
+    return urls_with_meta
+
+
 # ── Tải ảnh xuống ─────────────────────────────────────────────────────────────
 
 @retry(
     stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=5),
+    wait=wait_exponential_jitter(multiplier=1, min=1, max=5),
     retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS),
 )
 def _download_image_core(
@@ -734,13 +1276,24 @@ def _download_image_core(
         return False, None
 
     try:
-        img = Image.open(BytesIO(raw)).convert("RGB")
+        img = Image.open(BytesIO(raw))
+        # Tự động sửa hướng ảnh theo metadata EXIF (ảnh chụp điện thoại hay bị nghiêng)
+        # exif_transpose xoay ảnh đúng hướng trước khi convert sang RGB
+        from PIL import ImageOps
+        img = ImageOps.exif_transpose(img)
+        img = img.convert("RGB")
     except Exception:
         return False, None  # File không phải ảnh hợp lệ
 
     w, h = img.size
     # Lọc ảnh có kích thước quá nhỏ (thumbnail, icon, ảnh lỗi)
     if w < MIN_IMAGE_WIDTH or h < MIN_IMAGE_HEIGHT:
+        return False, None
+
+    # ── Validate chất lượng ảnh (lọc false positives) ──
+    is_valid, confidence = _validate_image_quality(img, "")  # class_name không dùng trong validate
+    if not is_valid:
+        log.debug("Ảnh bị loại do chất lượng thấp (confidence=%0.2f): %s", confidence, url)
         return False, None
 
     # Lưu tạm vào file _tmp_, sau đó đổi tên nguyên tử để tránh file bị hỏng nửa chừng
@@ -757,6 +1310,21 @@ def _download_image_core(
             pass
         raise
 
+    # ── CẢI TIẾN: Tính MD5 hash của ảnh để phát hiện trùng lặp ──
+    image_hash = _compute_image_hash(output_path)
+    
+    # ── CẢI TIẾN: Kiểm tra file corruption - thử mở lại ảnh vừa tải ──
+    try:
+        with Image.open(output_path) as verify_img:
+            verify_img.verify()  # Xác minh JPEG không bị corrupted
+    except Exception as exc:
+        log.warning("Ảnh vừa lưu bị corrupted, xóa và thử lại: %s — %s", output_path.name, exc)
+        try:
+            output_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False, None
+
     return True, {
         "filename": output_path.name,
         "width": w,
@@ -766,6 +1334,8 @@ def _download_image_core(
         "proxy_used": proxy or "Direct",
         "user_agent": ua,
         "download_time": datetime.now().isoformat(),
+        "confidence": confidence,  # Điểm tin cậy (0.0-1.0), cao hơn = ảnh tốt hơn
+        "image_hash": image_hash,  # MD5 hash để phát hiện trùng lặp
     }
 
 
@@ -792,6 +1362,189 @@ def download_image(
         return False, None
 
 
+# ── Hàm validate ảnh để lọc false positives ────────────────────────────────────
+
+def _validate_image_quality(img: Image.Image, class_name: str = "") -> Tuple[bool, float]:
+    """
+    Kiểm tra chất lượng ảnh để lọc ảnh fake/không liên quan.
+    
+    Cải tiến: Loại bỏ numpy dependency, dùng PIL thuần.
+    
+    Các tiêu chí:
+      1. Aspect ratio hợp lý (0.2 - 5.0)
+      2. Không phải ảnh quá đơn giản (solid color)
+      3. Kiểm tra entropy cơ bản
+    
+    Trả về: (is_valid, confidence_score)
+    confidence_score: 0.0-1.0, cao hơn = ảnh tốt hơn
+    """
+    try:
+        w, h = img.size
+        aspect_ratio = w / h if h > 0 else 1.0
+        
+        # ── Tiêu chí 1: Aspect ratio hợp lý ──
+        if aspect_ratio > 5 or aspect_ratio < 0.2:
+            return False, 0.1  # Quá dài hoặc quá vuông
+        
+        confidence = 0.5
+        
+        # ── Tiêu chí 2: Aspect ratio tốt ──
+        if 0.3 < aspect_ratio < 2.5:
+            confidence += 0.2
+        
+        # ── Tiêu chí 3: Entropy - kiểm tra ảnh không quá đơn giản ──
+        # Resize nhỏ để tính toán nhanh (không dùng numpy, dùng PIL.ImageStat)
+        img_small = img.resize((64, 64), Image.Resampling.LANCZOS)
+        
+        from PIL import ImageStat
+        try:
+            stat = ImageStat.Stat(img_small)
+            # Tính độ lệch chuẩn của mỗi kênh màu
+            stdev_list = stat.stddev if hasattr(stat, 'stddev') else []
+            avg_stdev = sum(stdev_list) / len(stdev_list) if stdev_list else 0.0
+            
+            # Ảnh quá đơn giản (solid color): avg_stdev < 10
+            if avg_stdev < 10:
+                confidence -= 0.3
+            elif avg_stdev > 50:
+                confidence += 0.1  # Ảnh phức tạp = tốt
+        except Exception:
+            pass  # Bỏ qua nếu lỗi, không ảnh hưởng validation
+        
+        # ── Tiêu chí 4: Kiểm tra màu xanh (green hue) ──
+        # Dùng PIL convert sang HSV, kiểm tra pixel count thay vì numpy array
+        try:
+            img_hsv = img_small.convert("HSV")
+            pixels = img_hsv.getdata()
+            
+            # Đếm pixel có hue xanh (Green range ~60-180 trong 0-255)
+            green_count = sum(1 for pixel in pixels if 60 <= pixel[0] <= 180)
+            green_ratio = green_count / len(pixels) if len(pixels) > 0 else 0.0
+            
+            if green_ratio > 0.15:
+                confidence += 0.3
+            elif green_ratio < 0.05:
+                confidence -= 0.2  # Quá ít green
+        except Exception:
+            pass  # Bỏ qua nếu lỗi
+        
+        confidence = max(0.0, min(1.0, confidence))
+        
+        # Quyết định: nếu confidence < 0.3 → loại
+        is_valid = confidence >= 0.3
+        
+        return is_valid, confidence
+        
+    except Exception as exc:
+        log.debug("Lỗi validate ảnh: %s", exc)
+        return True, 0.5  # Mặc định pass nếu lỗi
+
+
+# ── Hàm đếm URL available từ nền tảng ───────────────────────────────────────────
+
+def count_available_urls(
+    query: str,
+    platform: str = "bing",
+    headless: bool = True,
+    use_proxy: bool = False,
+    max_check: int = 500,
+) -> int:
+    """
+    Kiểm tra số lượng ảnh available từ một nền tảng cho một query cụ thể.
+    
+    Lưu ý: 
+    - Bing: lấy từ HTML, có thể không chính xác 100% nhưng gần thực tế
+    - Flickr: dùng API, chính xác hơn
+    - Pinterest: scroll và đếm, chậm hơn
+    
+    Trả về: Số lượng ảnh estimate (có thể lấy được), hoặc -1 nếu lỗi
+    """
+    try:
+        if platform.lower() == "bing":
+            driver = None
+            try:
+                options = uc.ChromeOptions()
+                if headless:
+                    options.add_argument("--headless")
+                options.add_argument(f"--user-agent={random_ua()}")
+                options.add_argument("--no-sandbox")
+                options.add_argument("--disable-dev-shm-usage")
+                
+                driver = uc.Chrome(options=options, version_main=None)
+                driver.set_page_load_timeout(30)  # Timeout 30s để tránh treo
+                driver.get(f"https://www.bing.com/images/search?q={quote_plus(query)}")
+                time.sleep(jitter(1.5, 2.5))
+                
+                # Scroll để tải thêm ảnh
+                count = 0
+                for _ in range(15):
+                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(0.5)
+                    
+                    # Đếm số ảnh có thể trích xuất
+                    try:
+                        iusc_els = driver.find_elements(By.CSS_SELECTOR, "a.iusc")
+                        count = len(iusc_els)
+                        if count >= max_check:
+                            break
+                    except:
+                        pass
+                
+                return min(count, max_check) if count > 0 else -1
+                
+            finally:
+                if driver:
+                    try:
+                        driver.quit()
+                    except:
+                        pass
+        
+        elif platform.lower() == "flickr":
+            session = _get_session()
+            try:
+                params = {
+                    "method": "flickr.photos.search",
+                    "api_key": FLICKR_API_KEY,
+                    "text": query,
+                    "per_page": 1,
+                    "format": "json",
+                    "nojsoncallback": 1,
+                }
+                headers = {"User-Agent": random_ua()}
+                
+                if session:
+                    resp = session.get(
+                        "https://www.flickr.com/services/rest/",
+                        params=params,
+                        timeout=15,
+                        headers=headers
+                    )
+                else:
+                    # Fallback urllib
+                    raise ImportError("requests not available, skip Flickr count")
+                
+                data = resp.json()
+                if data.get("stat") == "ok":
+                    total = int(data["photos"].get("total", 0))
+                    return min(total, max_check)
+                return -1
+                
+            except Exception as exc:
+                log.warning("Không thể đếm Flickr URLs: %s", exc)
+                return -1
+        
+        elif platform.lower() == "pinterest":
+            # Pinterest khó đếm chính xác → return estimate
+            return 100  # Estimate mặc định cho Pinterest
+        
+        else:
+            return -1
+            
+    except Exception as exc:
+        log.warning("Lỗi count URLs (%s): %s", platform, exc)
+        return -1
+
+
 # ── Thu thập ảnh cho từng lớp ────────────────────────────────────────────────
 
 def crawl_class_stealth(
@@ -800,22 +1553,33 @@ def crawl_class_stealth(
     max_images: int = 1000,
     headless: bool = True,
     scraper_type: str = "selenium",
+    platforms: Optional[List[str]] = None,
     use_proxy_for_browser: bool = False,
     use_proxy_for_download: bool = False,
     download_workers: int = 8,
 ) -> Dict:
     """
-    Thu thập hình ảnh cho một lớp bệnh cây trồng cụ thể.
+    Thu thập hình ảnh cho một lớp bệnh cây trồng cụ thể từ nhiều nền tảng.
 
     Tính năng:
       - Tự động tiếp tục từ điểm dừng nếu đã có ảnh/metadata từ lần trước.
       - Ghi metadata JSONL ngay sau mỗi ảnh tải thành công (an toàn khi sập).
       - Lọc URL trùng lặp qua seen_urls (áp dụng cho TẤT CẢ truy vấn của lớp này).
       - Số thứ tự file được đếm liên tục, nguyên tử qua các vòng lặp truy vấn.
+      - Hỗ trợ nhiều nền tảng: Bing, Flickr, Pinterest.
       - ThreadPoolExecutor chạy song song tải xuống ảnh (tác vụ I/O-bound).
+
+    Args:
+        platforms: Danh sách nền tảng cần dùng, ví dụ ["bing", "flickr", "pinterest"].
+                   Mặc định: ["bing"]
 
     Trả về dict gồm: số ảnh đã tải, số lần thử, metadata từng ảnh.
     """
+    if platforms is None:
+        platforms = ["bing"]
+    
+    platforms = [p.lower() for p in platforms]
+    
     class_dir = Path(output_root) / class_name
     ensure_dir(str(class_dir))
 
@@ -830,6 +1594,11 @@ def crawl_class_stealth(
 
     # Lock bảo vệ ghi metadata đồng thời từ nhiều luồng worker
     metadata_lock = threading.Lock()
+    
+    # ── CẢI TIẾN: Atomic counter để đảm bảo không bỏ lỗ chỉ số file ──
+    # Chỉ tăng counter khi ảnh thực sự được lưu thành công, không phải khi submit task
+    file_counter = next_file_idx
+    file_counter_lock = threading.Lock()
 
     def append_metadata(entry: Dict) -> None:
         """Ghi một dòng JSON vào metadata.jsonl, an toàn đa luồng."""
@@ -839,81 +1608,193 @@ def crawl_class_stealth(
 
     queries = SEARCH_QUERIES.get(class_name, [class_name])
 
+    # ── CẢI TIẾN: Tải hash của ảnh đã có sẵn để phát hiện trùng lặp ──
+    image_hashes: Set[str] = _load_image_hashes(class_dir)
+    if image_hashes:
+        log.info("[%s] Đã tải %d image hash từ metadata để phát hiện trùng lặp.", class_name, len(image_hashes))
+
     for q_idx, query in enumerate(queries):
         if downloaded >= max_images:
             break
 
         log.info(
-            "[%s] Truy vấn %d/%d: '%s' (chế độ %s)",
-            class_name, q_idx + 1, len(queries), query, scraper_type.upper(),
+            "[%s] Truy vấn %d/%d: '%s' (nền tảng: %s)",
+            class_name, q_idx + 1, len(queries), query, ", ".join(platforms).upper(),
         )
 
-        try:
-            if scraper_type.lower() == "nodriver":
-                urls_with_meta = run_async(fetch_image_urls_with_nodriver(
-                    query, max_results=max_images * 2,
-                    headless=headless, use_proxy=use_proxy_for_browser,
-                ))
+        # ── Kiểm tra số ảnh available từ mỗi nền tảng trước tải ──
+        platform_counts = {}
+        for platform in platforms:
+            remaining = max_images - downloaded
+            if remaining <= 0:
+                break
+            
+            log.info("[%s] Kiểm tra số ảnh available trên %s cho: '%s'",
+                    class_name, platform.upper(), query)
+            count = count_available_urls(query, platform=platform, max_check=remaining * 2)
+            if count > 0:
+                platform_counts[platform] = count
+                log.info("[%s:%s] Có ~%d ảnh available", class_name, platform.upper(), count)
             else:
-                urls_with_meta = fetch_image_urls_with_selenium(
-                    query, max_results=max_images * 2,
-                    headless=headless, use_proxy=use_proxy_for_browser,
-                )
-        except Exception as exc:
-            log.warning("Cào dữ liệu bằng %s thất bại: %s", scraper_type, exc)
-            continue
+                log.warning("[%s:%s] Không thể lấy số lượng ảnh (count=%d)", 
+                           class_name, platform.upper(), count)
 
-        if not urls_with_meta:
-            continue
-
-        # Lọc URL trùng lặp (kể cả URL đã tải trong lần chạy trước)
-        unique: List[Tuple[str, Dict]] = [
-            (url, meta) for url, meta in urls_with_meta
-            if url not in seen_urls and not seen_urls.add(url)  # type: ignore[func-returns-value]
-        ]
-
-        log.info(
-            "Lấy về %d URL → %d URL duy nhất sau khi lọc trùng.",
-            len(urls_with_meta), len(unique),
+        # Sắp xếp nền tảng theo số ảnh available (nhiều nhất trước)
+        sorted_platforms = sorted(
+            platforms,
+            key=lambda p: platform_counts.get(p, -1),
+            reverse=True
         )
+        
+        log.info("[%s] Thứ tự ưu tiên nền tảng: %s", class_name, 
+                ", ".join(f"{p.upper()}({platform_counts.get(p, 'N/A')})" for p in sorted_platforms))
 
-        # Chỉ tải số lượng ảnh còn thiếu
-        unique = unique[: max_images - downloaded]
-        if not unique:
-            continue
+        # Duyệt qua các nền tảng theo thứ tự ưu tiên (từ nhiều ảnh nhất đến ít nhất)
+        for platform in sorted_platforms:
+            if downloaded >= max_images:
+                break
+            
+            try:
+                if platform == "bing":
+                    if scraper_type.lower() == "nodriver":
+                        urls_with_meta = run_async(fetch_image_urls_with_nodriver(
+                            query, max_results=max_images * 2,
+                            headless=headless, use_proxy=use_proxy_for_browser,
+                        ))
+                    else:
+                        urls_with_meta = fetch_image_urls_with_selenium(
+                            query, max_results=max_images * 2,
+                            headless=headless, use_proxy=use_proxy_for_browser,
+                        )
+                elif platform == "pinterest":
+                    urls_with_meta = fetch_image_urls_with_pinterest(
+                        query, max_results=max_images * 2,
+                        headless=headless, use_proxy=use_proxy_for_browser,
+                    )
+                else:
+                    log.warning("Nền tảng không hỗ trợ: %s", platform)
+                    continue
+                    
+            except Exception as exc:
+                log.warning("Cào dữ liệu từ %s thất bại: %s", platform, exc)
+                continue
 
-        log.info("Đang bắt đầu %d lượt tải xuống (%d luồng worker) ...", len(unique), download_workers)
+            if not urls_with_meta:
+                continue
 
-        futures_map: Dict = {}
+            # Lọc URL trùng lặp (kể cả URL đã tải trong lần chạy trước)
+            unique: List[Tuple[str, Dict]] = [
+                (url, meta) for url, meta in urls_with_meta
+                if url not in seen_urls and not seen_urls.add(url)  # type: ignore[func-returns-value]
+            ]
 
-        with ThreadPoolExecutor(max_workers=download_workers) as pool:
-            for i, (url, url_meta) in enumerate(unique):
-                # Đặt tên file dựa trên next_file_idx (tăng liên tục, không phụ thuộc vào i)
-                img_path = class_dir / f"img_{next_file_idx + i:06d}.jpg"
-                futures_map[pool.submit(download_image, url, img_path, 20, use_proxy_for_download)] = (
-                    url_meta, img_path
+            log.info(
+                "[%s:%s] Lấy về %d URL → %d URL duy nhất sau khi lọc trùng.",
+                platform.upper(), class_name, len(urls_with_meta), len(unique),
+            )
+
+            # Lọc URL chứa từ khóa loại trừ (để tránh ảnh từ cây khác)
+            before_exclude = len(unique)
+            unique = [
+                (url, meta) for url, meta in unique
+                if not _should_exclude_url(url, query, class_name)
+            ]
+            excluded_count = before_exclude - len(unique)
+            if excluded_count > 0:
+                log.info(
+                    "[%s:%s] Loại trừ %d URL chứa từ khóa không phù hợp (ngô, sả, mía, v.v.)",
+                    class_name, platform.upper(), excluded_count,
                 )
 
-            for future in tqdm(as_completed(futures_map), total=len(futures_map), desc=class_name):
-                attempted += 1
-                url_meta, img_path = futures_map[future]
-                try:
-                    success, img_meta = future.result()
-                    if success and img_meta:
-                        downloaded += 1
-                        # Ghi metadata ngay lập tức sau mỗi ảnh thành công (an toàn khi sập)
-                        append_metadata({**url_meta, **img_meta})
-                except Exception as exc:
-                    log.warning("Lỗi luồng [%s]: %s", img_path.name, exc)
+            # Chỉ tải số lượng ảnh còn thiếu
+            unique = unique[: max_images - downloaded]
+            if not unique:
+                continue
 
-        # Cập nhật chỉ số file cho vòng truy vấn tiếp theo
-        next_file_idx += len(unique)
+            log.info("Đang bắt đầu %d lượt tải xuống từ %s (%d luồng worker) ...", 
+                     len(unique), platform.upper(), download_workers)
 
-    log.info("[%s] Hoàn thành — đã tải %d/%d ảnh.", class_name, downloaded, attempted)
+            futures_map: Dict = {}
+            
+            # ── CẢI TIẾN: Dùng file tạm để tránh lỗ lỗ chỉ số ──
+            # Mỗi task tải vào file tạm, chỉ rename thành img_000000.jpg khi thành công
+
+            with ThreadPoolExecutor(max_workers=download_workers) as pool:
+                for i, (url, url_meta) in enumerate(unique):
+                    # Tạo file tạm với tên random để tránh xung đột
+                    tmp_idx = random.randint(0, 999999999)
+                    tmp_path = class_dir / f"_tmp_download_{tmp_idx:010d}.jpg"
+                    futures_map[pool.submit(download_image, url, tmp_path, 20, use_proxy_for_download)] = (
+                        url_meta, tmp_path
+                    )
+
+                for future in tqdm(as_completed(futures_map), total=len(futures_map), desc=f"{class_name}:{platform}"):
+                    attempted += 1
+                    url_meta, tmp_path = futures_map[future]
+                    try:
+                        success, img_meta = future.result()
+                        if success and img_meta:
+                            # ── Chỉ đặt tên file cuối cùng nếu tải thành công ──
+                            # ── CẢI TIẾN: Kiểm tra trùng lặp dựa trên MD5 hash ──
+                            img_hash = img_meta.get("image_hash")
+                            if img_hash and img_hash in image_hashes:
+                                log.debug(
+                                    "Ảnh trùng lặp (hash=%s): %s — bỏ qua",
+                                    img_hash[:8], tmp_path.name,
+                                )
+                                # Xóa ảnh trùng lặp để tiết kiệm dung lượng
+                                try:
+                                    tmp_path.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+                                continue
+                            
+                            # Thêm hash vào tập hợp để phát hiện trùng lặp sau này
+                            if img_hash:
+                                image_hashes.add(img_hash)
+                            
+                            # ── Atomic naming: lấy index, rename file, cập nhật counter ──
+                            with file_counter_lock:
+                                final_idx = file_counter
+                                file_counter += 1
+                            
+                            final_path = class_dir / f"img_{final_idx:06d}.jpg"
+                            try:
+                                tmp_path.rename(final_path)
+                            except FileExistsError:
+                                # Nếu file đã tồn tại (rất hiếm), xóa tmp và bỏ qua
+                                try:
+                                    tmp_path.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+                                log.warning("File %s đã tồn tại, bỏ qua task này", final_path.name)
+                                continue
+                            
+                            # Cập nhật metadata với tên file chính xác
+                            img_meta["filename"] = final_path.name
+                            
+                            downloaded += 1
+                            # Ghi metadata ngay lập tức sau mỗi ảnh thành công (an toàn khi sập)
+                            append_metadata({**url_meta, **img_meta})
+                    except Exception as exc:
+                        log.warning("Lỗi luồng [%s]: %s", tmp_path.name, exc)
+                        # Dọn dẹp file tạm nếu lỗi
+                        try:
+                            tmp_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+
+            # ── CẢI TIẾN: Chỉ cập nhật next_file_idx sau khi hoàn toàn xong ──
+            # Không dùng next_file_idx += len(unique) nữa
+            next_file_idx = file_counter
+
+    log.info("[%s] Hoàn thành — đã tải %d/%d ảnh từ %s.", 
+             class_name, downloaded, attempted, ", ".join(platforms).upper())
     return {
         "class": class_name,
         "downloaded": downloaded,
         "attempted": attempted,
+        "platforms": platforms,
         "output_dir": str(class_dir),
     }
 
@@ -925,16 +1806,23 @@ def crawl_all_stealth(
     max_images_per_class: int = 1000,
     classes: Optional[List[str]] = None,
     scraper_type: str = "selenium",
+    platforms: Optional[List[str]] = None,
     use_proxy_for_browser: bool = False,
     use_proxy_for_download: bool = False,
     download_workers: int = 8,
 ) -> Dict:
     """
-    Thu thập tuần tự tất cả (hoặc một tập hợp các lớp được chọn) bệnh cây trồng.
+    Thu thập tuần tự tất cả (hoặc một tập hợp các lớp được chọn) bệnh cây trồng từ nhiều nền tảng.
 
     Tạo trước các thư mục: raw/, processed/, augmented/ để tránh lỗi đường dẫn sau này.
     Bỏ qua các lớp không có trong DATASET_CLASSES và ghi cảnh báo.
+    
+    Args:
+        platforms: Danh sách nền tảng, mặc định: ["bing", "flickr", "pinterest"]
     """
+    if platforms is None:
+        platforms = ["bing", "pinterest"]
+    
     root = Path(output_root)
     # Tạo trước cấu trúc thư mục dữ liệu
     for d in [root, root.parent / "processed", root.parent / "augmented"]:
@@ -955,6 +1843,7 @@ def crawl_all_stealth(
             max_images=max_images_per_class,
             headless=True,
             scraper_type=scraper_type,
+            platforms=platforms,
             use_proxy_for_browser=use_proxy_for_browser,
             use_proxy_for_download=use_proxy_for_download,
             download_workers=download_workers,
@@ -1012,12 +1901,19 @@ if __name__ == "__main__":
              f"Các lớp hợp lệ: {', '.join(DATASET_CLASSES.keys())}",
     )
     parser.add_argument(
-        "--max", type=int, default=100,
-        help="Số ảnh tối đa cần thu thập cho mỗi lớp.",
+        "--max", type=int, default=300,
+        help="Số ảnh tối đa cần thu thập cho mỗi lớp (mặc định: 300). "
+             "Bing thường cung cấp 100-140 ảnh mỗi query, nên với 4 query/lớp có thể đạt 300+.",
     )
     parser.add_argument(
         "--scraper", default="selenium", choices=["selenium", "nodriver"],
         help="Công cụ thu thập sử dụng: selenium (ổn định hơn) hoặc nodriver (CDP, ít bị phát hiện hơn).",
+    )
+    parser.add_argument(
+        "--platforms", nargs="+", default=["bing", "pinterest"],
+        help="Danh sách nền tảng cần dùng: bing, pinterest. "
+             "Lưu ý: ShutterStock là dịch vụ trả phí nên không hỗ trợ crawl công khai. "
+             "(Mặc định: bing pinterest)",
     )
     parser.add_argument(
         "--use-proxy-browser", action="store_true",
@@ -1032,16 +1928,29 @@ if __name__ == "__main__":
         help="Số luồng worker tải ảnh song song.",
     )
     parser.add_argument(
-        "--output", default=str(Path("data") / "raw"),
+        "--output", default=str(Path(__file__).parent.parent / "data" / "raw"),
         help="Thư mục đầu ra để lưu ảnh.",
     )
     args = parser.parse_args()
+
+    # Chuẩn hóa tên nền tảng
+    platforms = [p.lower() for p in args.platforms]
+    valid_platforms = ["bing", "pinterest"]
+    invalid = [p for p in platforms if p not in valid_platforms]
+    if invalid:
+        log.warning("Nền tảng không hỗ trợ (bỏ qua): %s. Hỗ trợ: %s", invalid, valid_platforms)
+        platforms = [p for p in platforms if p in valid_platforms]
+    
+    if not platforms:
+        log.error("Không có nền tảng hợp lệ. Hỗ trợ: %s", valid_platforms)
+        sys.exit(1)
 
     results = crawl_all_stealth(
         output_root=args.output,
         max_images_per_class=args.max,
         classes=[args.class_name] if args.class_name else None,
         scraper_type=args.scraper,
+        platforms=platforms,
         use_proxy_for_browser=args.use_proxy_browser,
         use_proxy_for_download=args.use_proxy_download,
         download_workers=args.workers,
@@ -1050,3 +1959,4 @@ if __name__ == "__main__":
     print("\n── Kết quả tổng hợp ──────────────────────────────────")
     for cls, res in results.items():
         print(f"  {cls:<22} {res['downloaded']:>5} ảnh đã tải / {res['attempted']:>5} ảnh thử tải")
+        print(f"    Nền tảng: {', '.join(res['platforms']).upper()}")
