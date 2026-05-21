@@ -64,6 +64,8 @@ try:
 except ImportError:
     log.warning("undetected_chromedriver chưa cài – chuyển sang selenium thuần")
     from selenium import webdriver as uc
+from selenium import webdriver as selenium_webdriver
+from selenium.webdriver.chrome.options import Options as SeleniumChromeOptions
 from selenium.webdriver.common.by import By
 
 try:
@@ -254,24 +256,40 @@ def _get_session():
 # ----------------------------------------------------------------------
 # Browser manager cho undetected_chromedriver
 # ----------------------------------------------------------------------
-def _init_uc_chrome(headless: bool, proxy: Optional[str], ua: str) -> uc.Chrome:
-    options = uc.ChromeOptions()
-    if headless:
-        options.add_argument("--headless")
-    if proxy:
-        options.add_argument(f"--proxy-server={proxy}")
-    options.add_argument(f"--user-agent={ua}")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-blink-features=AutomationControlled")
+def _init_uc_chrome(headless: bool, proxy: Optional[str], ua: str) -> "selenium_webdriver.Chrome":
+    """Khởi tạo Chrome driver, ưu tiên undetected_chromedriver, fallback selenium thường."""
+    # ── Thử undetected_chromedriver ──────────────────────────────
     try:
-        return uc.Chrome(options=options, version_main=None)
+        options = uc.ChromeOptions()
+        if headless:
+            options.add_argument("--headless")
+        if proxy:
+            options.add_argument(f"--proxy-server={proxy}")
+        options.add_argument(f"--user-agent={ua}")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        driver = uc.Chrome(options=options, version_main=None)
+        log.debug("Khởi tạo undetected_chromedriver thành công")
+        return driver
     except Exception as e:
-        match = re.search(r"Current browser version is (\d+)\.", str(e))
-        if match:
-            major = int(match.group(1))
-            return uc.Chrome(options=options, version_main=major)
-        raise
+        log.warning(f"undetected_chromedriver không dùng được ({e}), chuyển sang selenium thuần")
+
+    # ── Fallback: Selenium WebDriver thường ─────────────────────
+    selenium_options = SeleniumChromeOptions()
+    if headless:
+        selenium_options.add_argument("--headless")
+    if proxy:
+        selenium_options.add_argument(f"--proxy-server={proxy}")
+    selenium_options.add_argument(f"--user-agent={ua}")
+    selenium_options.add_argument("--no-sandbox")
+    selenium_options.add_argument("--disable-dev-shm-usage")
+    selenium_options.add_argument("--disable-blink-features=AutomationControlled")
+    # Thêm một số cờ để tránh bị phát hiện cơ bản
+    selenium_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    selenium_options.add_experimental_option("useAutomationExtension", False)
+    driver = selenium_webdriver.Chrome(options=selenium_options)
+    return driver
 
 class BrowserManager:
     def __init__(self, headless: bool = True, use_proxy: bool = False):
@@ -727,7 +745,7 @@ def _validate_image_quality(img: Image.Image, class_name: str = "") -> Tuple[boo
             confidence -= 0.1
 
         confidence = max(0.0, min(1.0, confidence))
-        return confidence >= 0.35, confidence
+        return confidence >= 0.30, confidence
     except Exception:
         return True, 0.5
 
