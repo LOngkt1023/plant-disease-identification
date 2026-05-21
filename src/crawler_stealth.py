@@ -117,14 +117,11 @@ DATASET_CLASSES: Dict[str, str] = {
 
 # Use central keyword/exclude definitions from keyword_filter
 try:
-    from .keyword_filter import EXCLUDE_KEYWORDS
+    from .keyword_filter import EXCLUDE_PATTERNS, CROP_EXCLUDE_PATTERNS, remove_vietnamese_diacritics
 except Exception:
-    from keyword_filter import EXCLUDE_KEYWORDS
+    from keyword_filter import EXCLUDE_PATTERNS, CROP_EXCLUDE_PATTERNS, remove_vietnamese_diacritics
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-]
+from .config import USER_AGENTS
 
 SEE_MORE_SELECTORS = [
     "input[type='button'][value='See more images']",
@@ -144,20 +141,22 @@ def _should_exclude_url(url: str, query: str, class_name: str) -> bool:
     except Exception:
         decoded = url.lower()
     text = f"{decoded} {query.lower()}"
+    # chuẩn hoá không dấu để khớp regex đã compile
+    text_no_accent = remove_vietnamese_diacritics(text)
     # Tìm nhóm cây từ class_name
     crop_group = None
     for c in ["Rice", "Coffee", "Tomato", "Citrus"]:
         if class_name.startswith(c):
             crop_group = c
             break
-    # Kiểm tra common
-    for pat in EXCLUDE_KEYWORDS["common"]:
-        if re.search(pat, text):
+    # Kiểm tra common using compiled patterns
+    for pattern in EXCLUDE_PATTERNS.get("common", []):
+        if pattern.search(text_no_accent):
             return True
-    # Kiểm tra theo nhóm
-    if crop_group and crop_group in EXCLUDE_KEYWORDS:
-        for pat in EXCLUDE_KEYWORDS[crop_group]:
-            if re.search(pat, text):
+    # Kiểm tra theo nhóm using compiled crop-specific patterns
+    if crop_group and crop_group in CROP_EXCLUDE_PATTERNS:
+        for pattern in CROP_EXCLUDE_PATTERNS[crop_group]:
+            if pattern.search(text_no_accent):
                 return True
     return False
 
