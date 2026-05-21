@@ -14,7 +14,7 @@ Kết quả:
 """
 
 import csv
-import hashlib
+from .utils import compute_md5
 import json
 import os
 import shutil
@@ -191,17 +191,7 @@ def validate_image_file(img_path: Path) -> Tuple[bool, str]:
 # Hash MD5 — phát hiện trùng lặp
 # ---------------------------------------------------------------------------
 
-def compute_md5(img_path: Path) -> str:
-    """Tính MD5 hash của nội dung tệp."""
-    hasher = hashlib.md5()
-    try:
-        with open(img_path, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
-                hasher.update(chunk)
-        return hasher.hexdigest()
-    except Exception as e:
-        print(f"  ⚠️  Hash lỗi ({img_path.name}): {e}")
-        return ""
+
 
 
 # ---------------------------------------------------------------------------
@@ -557,6 +547,186 @@ def get_image_size_stats(records: List[Dict]) -> Dict[str, Dict[str, float]]:
 
 
 # ---------------------------------------------------------------------------
+# Apply filter từ CSV → Move + Update metadata + Report
+# ---------------------------------------------------------------------------
+
+def apply_filter_from_csv(
+    csv_path: str,
+    source_dir: str,
+    rejected_dir: str,
+    dry_run: bool = False,
+) -> Dict:
+    """
+    Áp dụng kết quả filter từ CSV:
+    - Move ảnh REJECTED → data/rejected/<class>/
+    - Cập nhật metadata.jsonl (xóa entry ảnh bị loại)
+    - In báo cáo thống kê
+
+    CSV có thể có nhiều schema khác nhau → auto-detect cột:
+        filename / file_name / image / path
+        status / decision / label
+        reason / reject_reason
+    """
+
+    csv_path = Path(csv_path)
+    source_dir = Path(source_dir)
+    rejected_dir = Path(rejected_dir)
+
+    rejected_dir.mkdir(parents=True, exist_ok=True)
+
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV không tồn tại: {csv_path}")
+    if not source_dir.exists():
+        raise FileNotFoundError(f"Source dir không tồn tại: {source_dir}")
+
+    print(f"\n📄 Đang đọc CSV: {csv_path}")
+    print(f"📁 Source: {source_dir}")
+    print(f"🗑️ Rejected: {rejected_dir}")
+    print(f"{'🧪 DRY RUN (không di chuyển file)' if dry_run else '🚀 APPLY CHANGES'}")
+
+    # -----------------------------------------------------------------------
+    # Detect columns
+    # -----------------------------------------------------------------------
+
+    def pick_col(row_keys, candidates):
+        for c in candidates:
+            if c in row_keys:
+                return c
+        return None
+
+    # -----------------------------------------------------------------------
+    # Load CSV
+    # -----------------------------------------------------------------------
+
+    rejected_files = set()
+    accepted_files = set()
+    reject_reasons: Dict[str, int] = {}
+
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            raise ValueError("CSV không có header")
+
+        keys = [k.strip() for k in reader.fieldnames]
+
+        col_file = pick_col(keys, ["filename", "file_name", "image", "path"])
+        col_status = pick_col(keys, ["status", "decision", "label"])
+        col_reason = pick_col(keys, ["reason", "reject_reason"])
+
+        if not col_file or not col_status:
+            raise ValueError(
+                f"Không tìm thấy cột cần thiết trong CSV. Found={keys}"
+            )
+
+        print(f"🔎 Column mapping:")
+        print(f"   file   → {col_file}")
+        print(f"   status → {col_status}")
+        print(f"   reason → {col_reason}")
+
+        for row in reader:
+            fname = (row.get(col_file) or "").strip()
+            status = (row.get(col_status) or "").strip().lower()
+            reason = (row.get(col_reason) or "unknown").strip()
+
+            if not fname:
+                continue
+
+            # Normalize path → chỉ lấy filename
+            fname = Path(fname).name
+
+            if status in ("rejected", "reject", "0", "false"):
+                rejected_files.add(fname)
+                reject_reasons[reason] = reject_reasons.get(reason, 0) + 1
+            else:
+                accepted_files.add(fname)
+
+    # -----------------------------------------------------------------------
+    # Move rejected images
+    # -----------------------------------------------------------------------
+
+    moved = 0
+    missing = 0
+
+    for fname in rejected_files:
+        src = source_dir / fname
+        dst = rejected_dir / fname
+
+        if not src.exists():
+            missing += 1
+            continue
+
+        if dry_run:
+            print(f"[DRY] move {src} → {dst}")
+        else:
+            try:
+                shutil.move(str(src), str(dst))
+                moved += 1
+            except Exception as e:
+                print(f"⚠️ Move lỗi {src}: {e}")
+
+    # -----------------------------------------------------------------------
+    # Update metadata.jsonl
+    # -----------------------------------------------------------------------
+
+    meta_path = source_dir / "metadata.jsonl"
+    kept_entries = []
+    removed_entries = 0
+
+    if meta_path.exists():
+        with open(meta_path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                    fname = entry.get("filename")
+                    if fname in rejected_files:
+                        removed_entries += 1
+                        continue
+                    kept_entries.append(entry)
+                except:
+                    continue
+
+        if not dry_run:
+            with open(meta_path, "w", encoding="utf-8") as f:
+                for entry in kept_entries:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    # -----------------------------------------------------------------------
+    # Report
+    # -----------------------------------------------------------------------
+
+    total = len(rejected_files) + len(accepted_files)
+    accept_rate = len(accepted_files) / total if total else 0
+
+    print("\n📊 REPORT")
+    print("─" * 50)
+    print(f"Tổng ảnh        : {total}")
+    print(f"Accepted        : {len(accepted_files)}")
+    print(f"Rejected        : {len(rejected_files)}")
+    print(f"Accept rate     : {accept_rate:.2%}")
+    print(f"Moved           : {moved}")
+    print(f"Missing file    : {missing}")
+    print(f"Metadata removed: {removed_entries}")
+
+    if reject_reasons:
+        print("\nTop reject reasons:")
+        top = sorted(reject_reasons.items(), key=lambda x: x[1], reverse=True)[:10]
+        for reason, count in top:
+            print(f"  - {reason}: {count}")
+
+    return {
+        "total": total,
+        "accepted": len(accepted_files),
+        "rejected": len(rejected_files),
+        "accept_rate": accept_rate,
+        "moved": moved,
+        "missing": missing,
+        "metadata_removed": removed_entries,
+        "reasons": reject_reasons,
+        "dry_run": dry_run,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint CLI
 # ---------------------------------------------------------------------------
 
@@ -564,61 +734,53 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description=(
-            "Làm sạch dataset ảnh lúa bằng pipeline 2 tầng AI "
-            "(CLIP + Rice-Leaf-Disease)."
-        )
+        description="Data cleaning & filter tooling"
     )
-    parser.add_argument(
-        "--data-root",
-        default=str(DATA_RAW_DIR),
-        help=f"Thư mục dữ liệu thô (mặc định: {DATA_RAW_DIR})",
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    # -----------------------------------------------------------------------
+    # Command: apply-filter
+    # -----------------------------------------------------------------------
+
+    parser_filter = subparsers.add_parser(
+        "apply-filter",
+        help="Áp dụng CSV filter → move rejected + update metadata"
     )
-    parser.add_argument(
-        "--output",
-        default=str(CSV_METADATA),
-        help=f"File CSV tổng hợp (mặc định: {CSV_METADATA})",
+
+    parser_filter.add_argument(
+        "--csv", required=True,
+        help="Path tới file CSV filter (vd: rice_healthy_filtered.csv)"
     )
-    parser.add_argument(
-        "--rejected",
-        default=str(DATA_REJECTED_DIR),
-        help=f"Thư mục cách ly ảnh rác (mặc định: {DATA_REJECTED_DIR})",
+
+    parser_filter.add_argument(
+        "--source", required=True,
+        help="Thư mục nguồn (vd: data/raw/Rice_Healthy)"
     )
-    parser.add_argument(
-        "--clip-threshold",
-        type=float,
-        default=0.4,
-        help="Ngưỡng xác suất CLIP để chấp nhận là lá lúa (mặc định: 0.4)",
+
+    parser_filter.add_argument(
+        "--rejected", required=True,
+        help="Thư mục rejected (vd: data/rejected/Rice_Healthy)"
     )
-    parser.add_argument(
-        "--no-filtered-csv",
+
+    parser_filter.add_argument(
+        "--dry-run",
         action="store_true",
-        help="Không ghi file rice_healthy_filtered.csv",
+        help="Chỉ preview, không di chuyển file"
     )
+
+    # -----------------------------------------------------------------------
+    # Parse args
+    # -----------------------------------------------------------------------
+
     args = parser.parse_args()
 
-    records = scan_and_clean_dataset(
-        data_root=args.data_root,
-        output_csv=args.output,
-        rejected_root=args.rejected,
-        clip_threshold=args.clip_threshold,
-        write_filtered_csv=not args.no_filtered_csv,
-    )
-
-    if records:
-        print("📊 Phân bổ theo lớp:")
-        for cls, cnt in get_class_distribution(records).items():
-            print(f"  {cls:<28} {cnt:>5} ảnh")
-
-        print("\n🔬 Phân bổ theo nhãn bệnh:")
-        for label, cnt in get_disease_distribution(records).items():
-            print(f"  {label:<28} {cnt:>5} ảnh")
-
-        print("\n📏 Thống kê kích thước ảnh:")
-        print(f"  {'Lớp':<28} {'Rộng (min/max/mean)':<26} {'Cao (min/max/mean)'}")
-        for cls, s in get_image_size_stats(records).items():
-            w_str = f"{s['w_min']:.0f}/{s['w_max']:.0f}/{s['w_mean']:.0f}"
-            h_str = f"{s['h_min']:.0f}/{s['h_max']:.0f}/{s['h_mean']:.0f}"
-            print(f"  {cls:<28} {w_str:<26} {h_str}")
+    if args.command == "apply-filter":
+        apply_filter_from_csv(
+            csv_path=args.csv,
+            source_dir=args.source,
+            rejected_dir=args.rejected,
+            dry_run=args.dry_run,
+        )
     else:
-        print("\n⚠️  Không có ảnh hợp lệ nào trong dataset!")
+        parser.print_help()

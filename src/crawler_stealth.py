@@ -28,7 +28,7 @@ from urllib.parse import quote_plus, unquote
 import urllib.error
 import urllib.request
 
-import hashlib
+from .utils import compute_md5
 from PIL import Image
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 from tqdm import tqdm
@@ -113,82 +113,13 @@ DATASET_CLASSES: Dict[str, str] = {
     "Citrus_Greening": "Cam bệnh vàng lá",
 }
 
-# Từ khóa tìm kiếm (rút gọn: chỉ tiếng Anh)
-SEARCH_QUERIES: Dict[str, List[str]] = {
-    "Rice_Healthy": [
-        "healthy rice leaf close-up single",
-        "Oryza sativa healthy leaf macro",
-        "rice plant green leaf",
-    ],
-    "Rice_Blast": [
-        "rice blast disease leaf close-up",
-        "Magnaporthe oryzae rice leaf lesion",
-        "rice blast brown spot macro",
-    ],
-    "Rice_Blight": [
-        "rice bacterial blight leaf close-up",
-        "Xanthomonas oryzae rice leaf",
-        "rice blight yellowing leaf",
-    ],
-    "Coffee_Healthy": [
-        "healthy coffee leaf single close-up",
-        "Coffea arabica green leaf macro",
-        "coffee plant leaf isolated",
-    ],
-    "Coffee_Rust": [
-        "coffee leaf rust disease close-up",
-        "Hemileia vastatrix coffee leaf spots",
-        "coffee rust fungus leaf",
-    ],
-    "Tomato_Healthy": [
-        "healthy tomato leaf single close-up",
-        "Solanum lycopersicum leaf macro",
-        "tomato plant green leaf",
-    ],
-    "Tomato_Blight": [
-        "tomato late blight leaf close-up",
-        "Phytophthora infestans tomato leaf",
-        "tomato blight brown lesion",
-    ],
-    "Tomato_Curl": [
-        "tomato leaf curl virus close-up",
-        "TYLCV tomato curled leaf",
-        "tomato leaf curl disease",
-    ],
-    "Citrus_Canker": [
-        "citrus canker disease leaf close-up",
-        "Xanthomonas citri citrus leaf lesion",
-        "orange leaf canker spots macro",
-    ],
-    "Citrus_Greening": [
-        "citrus greening HLB disease leaf",
-        "Huanglongbing citrus yellow mottled leaf",
-        "citrus greening leaf symptoms",
-    ],
-}
+# Search queries are defined centrally in src/search_profiles.py
 
-# Từ khóa loại trừ (chung + theo nhóm cây)
-EXCLUDE_KEYWORDS = {
-    "common": [
-        r"\binfographic\b", r"\bdiagram\b", r"\bcartoon\b", r"\bchart\b", r"\bgraph\b",
-        r"\bvector\b", r"\billustration\b", r"\bicon\b", r"\blogo\b", r"\bflower\b",
-        r"\bblossom\b", r"\bhuman\b", r"\bperson\b", r"\bhand\b", r"\bfood\b", r"\brecipe\b",
-        r"\bpublicdomainpictures\b", r"\balamy\b", r"\bistock\b", r"\bshutterstock\b",
-    ],
-    "Rice": [
-        r"\bcorn\b", r"\bmaize\b", r"\bwheat\b", r"\bbarley\b", r"\bcoffee\b", r"\btomato\b",
-        r"\bcitrus\b", r"\borange\b", r"\blemon\b", r"\bpotato\b", r"\bpepper\b",
-    ],
-    "Coffee": [
-        r"\brice\b", r"\bcorn\b", r"\bwheat\b", r"\btomato\b", r"\bcitrus\b", r"\btea\b",
-    ],
-    "Tomato": [
-        r"\brice\b", r"\bcorn\b", r"\bcoffee\b", r"\bcitrus\b", r"\bpotato\b", r"\bpepper\b",
-    ],
-    "Citrus": [
-        r"\brice\b", r"\bcorn\b", r"\bcoffee\b", r"\btomato\b", r"\bapple\b", r"\bpear\b",
-    ],
-}
+# Use central keyword/exclude definitions from keyword_filter
+try:
+    from .keyword_filter import EXCLUDE_KEYWORDS
+except Exception:
+    from keyword_filter import EXCLUDE_KEYWORDS
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -239,8 +170,7 @@ def _cleanup_temp_files(class_dir: Path) -> None:
 
 def _compute_image_hash(img_path: Path) -> Optional[str]:
     try:
-        with open(img_path, "rb") as f:
-            return hashlib.md5(f.read()).hexdigest()
+        return compute_md5(img_path)
     except Exception:
         return None
 
@@ -298,79 +228,11 @@ def _load_existing_state(class_dir: Path) -> Tuple[int, int, Set[str]]:
         log.info(f"  Resume: {downloaded} ảnh, tiêp tục từ img_{next_idx:06d}.jpg")
     return next_idx, downloaded, downloaded_urls
 
-# ----------------------------------------------------------------------
-# ProxyPool (thread-safe)
-# ----------------------------------------------------------------------
-class ProxyPool:
-    _HEALTH_URL = "https://httpbin.org/ip"
-    _HEALTH_TIMEOUT = 5
-    _MIN_HEALTHY = 3
-    _MAX_CANDIDATES = 40
-
-    def __init__(self):
-        self.active_pool: List[str] = []
-        self._lock = threading.Lock()
-
-    def _scrape_candidates(self) -> List[str]:
-        candidates = []
-        try:
-            req = urllib.request.Request(
-                "https://free-proxy-list.net/",
-                headers={"User-Agent": USER_AGENTS[0]},
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                html = resp.read().decode("utf-8")
-            for ip, port in re.findall(r"<td>(\d{1,3}(?:\.\d{1,3}){3})</td><td>(\d+)</td>", html)[:self._MAX_CANDIDATES]:
-                candidates.append(f"http://{ip}:{port}")
-        except Exception as e:
-            log.warning(f"Cào proxy thất bại: {e}")
-        return candidates
-
-    def _is_alive(self, proxy: str) -> bool:
-        try:
-            handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
-            opener = urllib.request.build_opener(handler)
-            req = urllib.request.Request(self._HEALTH_URL, headers={"User-Agent": USER_AGENTS[0]})
-            with opener.open(req, timeout=self._HEALTH_TIMEOUT) as resp:
-                if resp.status != 200:
-                    return False
-                body = resp.read().decode("utf-8", errors="ignore")
-                data = json.loads(body)
-                return "origin" in data
-        except Exception:
-            return False
-
-    def _refresh(self):
-        log.info("Proxy pool rỗng – đang cập nhật...")
-        candidates = self._scrape_candidates()
-        if not candidates:
-            log.warning("Không tìm thấy proxy nào")
-            return
-        healthy = []
-        for p in candidates:
-            if self._is_alive(p):
-                healthy.append(p)
-                log.info(f"  [OK] {p}")
-                if len(healthy) >= self._MIN_HEALTHY:
-                    break
-        self.active_pool = healthy
-        log.info(f"Pool hoạt động: {len(self.active_pool)} proxy")
-
-    def get(self) -> Optional[str]:
-        with self._lock:
-            if not self.active_pool:
-                self._refresh()
-            return random.choice(self.active_pool) if self.active_pool else None
-
-    def remove(self, proxy: str):
-        with self._lock:
-            try:
-                self.active_pool.remove(proxy)
-                log.info(f"Đã loại proxy {proxy}")
-            except ValueError:
-                pass
-
-proxy_pool = ProxyPool()
+# Proxy pool implementation moved to src/proxy.py
+try:
+    from .proxy import proxy_pool
+except Exception:
+    from proxy import proxy_pool
 
 # ----------------------------------------------------------------------
 # Session HTTP (thread‑local)
@@ -988,10 +850,7 @@ def crawl_class_stealth(
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     browser_mgr = BrowserManager(headless=headless, use_proxy=use_proxy_for_browser)
-    queries = build_search_queries(
-        class_name,
-        fallback=SEARCH_QUERIES.get(class_name, [class_name]),
-    )
+    queries = build_search_queries(class_name)
 
     try:
         for q_idx, query in enumerate(queries):

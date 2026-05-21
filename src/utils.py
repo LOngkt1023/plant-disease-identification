@@ -1,3 +1,14 @@
+from pathlib import Path
+import hashlib
+from typing import Optional
+
+def compute_md5(img_path: Path) -> Optional[str]:
+    """Compute MD5 hash of file or return None on error."""
+    try:
+        with open(img_path, "rb") as f:
+            return hashlib.md5(f.read()).hexdigest()
+    except Exception:
+        return None
 """Các tiện ích hỗ trợ xuất nhập tập dữ liệu và vẽ biểu đồ."""
 
 from pathlib import Path

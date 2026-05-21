@@ -34,4 +34,3 @@ nodriver
 duckduckgo-search>=8.0.0
 curl_cffi>=0.5.0
 tenacity
-``
