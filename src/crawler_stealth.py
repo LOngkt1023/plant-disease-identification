@@ -96,9 +96,6 @@ SOURCE_ALIASES: Dict[str, str] = {
 RETRYABLE_EXCEPTIONS = (ConnectionError, TimeoutError, OSError,
                         urllib.error.URLError, urllib.error.HTTPError)
 
-MIN_IMAGE_WIDTH = 200
-MIN_IMAGE_HEIGHT = 200
-
 # Các lớp dữ liệu
 DATASET_CLASSES: Dict[str, str] = {
     "Rice_Healthy": "Lúa khỏe mạnh",
@@ -121,12 +118,7 @@ try:
 except Exception:
     from keyword_filter import EXCLUDE_PATTERNS, CROP_EXCLUDE_PATTERNS, remove_vietnamese_diacritics
 
-from .config import USER_AGENTS
-
-SEE_MORE_SELECTORS = [
-    "input[type='button'][value='See more images']",
-    "input[value='See more images']", "#seemorekey", ".b_seemore", ".mop",
-]
+from .config import USER_AGENTS, SEE_MORE_SELECTORS, MIN_IMAGE_WIDTH, MIN_IMAGE_HEIGHT
 
 # ----------------------------------------------------------------------
 # Hàm tiện ích
