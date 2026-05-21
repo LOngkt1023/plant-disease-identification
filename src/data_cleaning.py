@@ -1,159 +1,624 @@
-"""Phân hệ làm sạch và xác thực dữ liệu.
+"""Phân hệ làm sạch và xác thực dữ liệu nâng cấp — Pipeline 2 tầng AI.
 
-Xử lý:
-  - Xác thực URL và loại bỏ trùng lặp
-  - Phát hiện tệp lỗi hỏng
-  - Phát hiện ảnh trùng lặp (bằng mã băm hash)
-  - Làm sạch siêu dữ liệu (metadata)
+Pipeline:
+  Tầng 0 — Xác thực cơ bản   : Kiểm tra file tồn tại, kích thước ≥ 1KB, PIL verify.
+  Tầng 1 — Lọc chủ đề (CLIP) : Xác nhận ảnh là lá lúa (openai/clip-vit-base-patch32).
+  Tầng 2 — Phân loại bệnh    : Gán nhãn bệnh (prithivMLmods/Rice-Leaf-Disease).
+  Tầng 3 — Phát hiện trùng   : Loại bỏ ảnh trùng lặp qua MD5 hash.
+
+Kết quả:
+  - Ảnh rác → cách ly vào `data/rejected/<class>/`
+  - Ảnh sạch → metadata được ghi lại vào `metadata.jsonl` của từng lớp
+  - Báo cáo CSV đầy đủ → `src/rice_healthy_filtered.csv`
+  - Báo cáo tổng hợp toàn dataset → `data/raw/_metadata.csv`
 """
 
+import csv
 import hashlib
+import json
 import os
+import shutil
+import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
-import pandas as pd
 from PIL import Image
 from tqdm import tqdm
 
+# ---------------------------------------------------------------------------
+# Cấu hình đường dẫn mặc định
+# ---------------------------------------------------------------------------
+_SRC_DIR = Path(__file__).parent
+_PROJECT_ROOT = _SRC_DIR.parent
 
-def compute_image_hash(img_path: Path, method: str = "md5") -> str:
-    """Tính toán mã băm của tệp ảnh để phát hiện ảnh trùng lặp."""
-    hasher = hashlib.md5() if method == "md5" else hashlib.sha256()
+DATA_RAW_DIR       = _PROJECT_ROOT / "data" / "raw"
+DATA_REJECTED_DIR  = _PROJECT_ROOT / "data" / "rejected"
+CSV_FILTERED       = _SRC_DIR / "rice_healthy_filtered.csv"      # khớp filter_rice_images.py
+CSV_METADATA       = DATA_RAW_DIR / "_metadata.csv"
+
+# Nhãn bệnh lúa hỗ trợ (phải khớp với model Rice-Leaf-Disease)
+RICE_DISEASE_LABELS: List[str] = [
+    "Bacterial Blight",
+    "Blast",
+    "Brown Spot",
+    "Healthy",
+    "Tungro",
+]
+
+# ---------------------------------------------------------------------------
+# Tầng 1 — CLIP filter (kiểm tra ảnh có phải lá lúa không)
+# ---------------------------------------------------------------------------
+
+def _load_clip_model():
+    """Tải model CLIP (lazy, chỉ tải một lần)."""
     try:
-        with open(img_path, "rb") as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                hasher.update(chunk)
-        return hasher.hexdigest()
+        from transformers import CLIPModel, CLIPProcessor
+        model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+        processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+        model.eval()
+        return model, processor
     except Exception as e:
-        print(f"Lỗi khi tính mã băm cho {img_path}: {e}")
-        return None
+        print(f"⚠️  Không thể tải CLIP model: {e}")
+        return None, None
 
+
+_CLIP_MODEL = None
+_CLIP_PROCESSOR = None
+
+def _get_clip():
+    global _CLIP_MODEL, _CLIP_PROCESSOR
+    if _CLIP_MODEL is None:
+        print("⏳ Đang tải CLIP model (lần đầu chạy có thể mất vài phút)...")
+        _CLIP_MODEL, _CLIP_PROCESSOR = _load_clip_model()
+    return _CLIP_MODEL, _CLIP_PROCESSOR
+
+
+def is_rice_leaf_clip(
+    image_path: Path,
+    threshold: float = 0.4,
+) -> Tuple[bool, float]:
+    """Tầng 1: Dùng CLIP để kiểm tra xem ảnh có phải lá lúa không.
+
+    Args:
+        image_path: Đường dẫn tệp ảnh.
+        threshold:  Ngưỡng xác suất tối thiểu để chấp nhận là lá lúa.
+
+    Returns:
+        (is_rice, clip_rice_prob)
+    """
+    model, processor = _get_clip()
+    if model is None:
+        # Fallback: chấp nhận tất cả nếu không tải được model
+        return True, 1.0
+
+    try:
+        import torch
+        image = Image.open(image_path).convert("RGB")
+        texts = [
+            "a photo of a rice leaf",
+            "a photo of a green leaf",
+            "a photo of a tree leaf",
+            "a photo of a grass blade",
+        ]
+        inputs = processor(text=texts, images=image, return_tensors="pt", padding=True)
+        with torch.no_grad():
+            outputs = model(**inputs)
+        probs = outputs.logits_per_image.softmax(dim=1)
+        rice_prob = float(probs[0][0].item())
+        return rice_prob > threshold, rice_prob
+    except Exception as e:
+        print(f"  ⚠️  CLIP lỗi ({image_path.name}): {e}")
+        return False, 0.0
+
+
+# ---------------------------------------------------------------------------
+# Tầng 2 — Rice-Leaf-Disease classifier
+# ---------------------------------------------------------------------------
+
+def _load_rice_model():
+    """Tải model phân loại bệnh lúa (lazy)."""
+    try:
+        from transformers import AutoImageProcessor, SiglipForImageClassification
+        rice_model_name = "prithivMLmods/Rice-Leaf-Disease"
+        processor = AutoImageProcessor.from_pretrained(rice_model_name)
+        model = SiglipForImageClassification.from_pretrained(rice_model_name)
+        model.eval()
+        return model, processor
+    except Exception as e:
+        print(f"⚠️  Không thể tải Rice-Leaf-Disease model: {e}")
+        return None, None
+
+
+_RICE_MODEL = None
+_RICE_PROCESSOR = None
+
+def _get_rice_model():
+    global _RICE_MODEL, _RICE_PROCESSOR
+    if _RICE_MODEL is None:
+        print("⏳ Đang tải Rice-Leaf-Disease model...")
+        _RICE_MODEL, _RICE_PROCESSOR = _load_rice_model()
+    return _RICE_MODEL, _RICE_PROCESSOR
+
+
+def predict_rice_disease(image_path: Path) -> Tuple[str, float]:
+    """Tầng 2: Phân loại bệnh lúa và trả về (nhãn, độ tin cậy).
+
+    Returns:
+        (label, confidence) — label là một trong RICE_DISEASE_LABELS.
+    """
+    model, processor = _get_rice_model()
+    if model is None:
+        return "Unknown", 0.0
+
+    try:
+        import torch
+        image = Image.open(image_path).convert("RGB")
+        inputs = processor(images=image, return_tensors="pt")
+        with torch.no_grad():
+            outputs = model(**inputs)
+            probs = torch.nn.functional.softmax(outputs.logits, dim=1).squeeze()
+        max_conf, idx = torch.max(probs, dim=0)
+        label = RICE_DISEASE_LABELS[int(idx.item())]
+        return label, float(max_conf.item())
+    except Exception as e:
+        print(f"  ⚠️  Rice model lỗi ({image_path.name}): {e}")
+        return "Unknown", 0.0
+
+
+# ---------------------------------------------------------------------------
+# Tầng 0 — Xác thực tệp cơ bản
+# ---------------------------------------------------------------------------
 
 def validate_image_file(img_path: Path) -> Tuple[bool, str]:
-    """Xác thực tính toàn vẹn của tệp ảnh.
-    
-    Trả về: (is_valid, lý do)
+    """Kiểm tra tính toàn vẹn của tệp ảnh (tồn tại, kích thước, PIL verify).
+
+    Returns:
+        (is_valid, reason) — reason là "OK" hoặc mô tả lỗi.
     """
     if not img_path.exists():
-        return False, "Không tìm thấy tệp"
-
+        return False, "file_not_found"
     if img_path.stat().st_size < 1024:
-        return False, "Tệp quá nhỏ (<1KB)"
-
+        return False, "file_too_small (<1KB)"
     try:
         with Image.open(img_path) as img:
             img.verify()
         return True, "OK"
     except Exception as e:
-        return False, f"Ảnh lỗi: {str(e)[:50]}"
+        return False, f"corrupted: {str(e)[:60]}"
 
+
+# ---------------------------------------------------------------------------
+# Hash MD5 — phát hiện trùng lặp
+# ---------------------------------------------------------------------------
+
+def compute_md5(img_path: Path) -> str:
+    """Tính MD5 hash của nội dung tệp."""
+    hasher = hashlib.md5()
+    try:
+        with open(img_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    except Exception as e:
+        print(f"  ⚠️  Hash lỗi ({img_path.name}): {e}")
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Metadata helpers
+# ---------------------------------------------------------------------------
+
+def load_metadata_map(class_dir: Path) -> Dict[str, Dict]:
+    """Tải `metadata.jsonl` thành dict {filename → entry}."""
+    meta_map: Dict[str, Dict] = {}
+    meta_path = class_dir / "metadata.jsonl"
+    if not meta_path.exists():
+        return meta_map
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    fn = entry.get("filename")
+                    if fn:
+                        meta_map[fn] = entry
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"  ⚠️  Không tải được metadata.jsonl ({class_dir.name}): {e}")
+    return meta_map
+
+
+# ---------------------------------------------------------------------------
+# Core: quét & làm sạch toàn bộ dataset
+# ---------------------------------------------------------------------------
 
 def scan_and_clean_dataset(
-    data_root: str = "data\\raw",
-    output_metadata: str = "data\\raw\\_metadata.csv",
-) -> pd.DataFrame:
-    """Quét tất cả các ảnh, xác thực và phát hiện ảnh trùng lặp.
-    
-    Trả về DataFrame chứa siêu dữ liệu ảnh và kết quả xác thực.
-    """
-    data_root = Path(data_root)
-    records = []
+    data_root: Optional[str] = None,
+    output_csv: Optional[str] = None,
+    rejected_root: Optional[str] = None,
+    clip_threshold: float = 0.4,
+    write_filtered_csv: bool = True,
+) -> List[Dict]:
+    """Quét toàn bộ dataset, áp dụng pipeline 4 tầng và xuất báo cáo CSV.
 
-    # Quét qua tất cả các lớp phân loại
-    for class_dir in data_root.iterdir():
-        if not class_dir.is_dir():
+    Args:
+        data_root:          Thư mục gốc chứa các lớp ảnh (mặc định: data/raw/).
+        output_csv:         Đường dẫn file CSV tổng hợp toàn dataset.
+        rejected_root:      Thư mục cách ly ảnh lỗi (mặc định: data/rejected/).
+        clip_threshold:     Ngưỡng xác suất CLIP để chấp nhận là lá lúa (default 0.4).
+        write_filtered_csv: Có ghi file `rice_healthy_filtered.csv` hay không.
+
+    Returns:
+        Danh sách các bản ghi của ảnh hợp lệ được giữ lại.
+    """
+    root = Path(data_root) if data_root else DATA_RAW_DIR
+    rejected = Path(rejected_root) if rejected_root else DATA_REJECTED_DIR
+    csv_out = Path(output_csv) if output_csv else CSV_METADATA
+
+    # Tự động điều chỉnh nếu chạy từ bên trong thư mục src/
+    if not root.exists():
+        fallback = Path("..") / root
+        if fallback.exists():
+            print(f"⚠️  Phát hiện chạy từ thư mục con. Dùng đường dẫn: {fallback}")
+            root = fallback
+            rejected = Path("..") / rejected
+            csv_out = Path("..") / csv_out
+        else:
+            raise FileNotFoundError(
+                f"Không tìm thấy thư mục dữ liệu: '{root}'"
+            )
+
+    rejected.mkdir(parents=True, exist_ok=True)
+
+    # Thống kê tổng hợp
+    stats = {
+        "scanned":  0,
+        "kept":     0,
+        "rejected": 0,
+        "reasons": {
+            "invalid_file":    0,
+            "not_rice_leaf":   0,
+            "duplicate_hash":  0,
+            "unknown_disease": 0,
+        },
+    }
+
+    # Ghi rice_healthy_filtered.csv theo chuẩn filter_rice_images.py
+    filtered_rows: List[List] = []      # [filename, final_label, disease_conf, clip_rice_prob]
+
+    # Bản ghi toàn dataset cho CSV tổng hợp
+    all_records: List[Dict] = []
+
+    print(f"\n{'='*72}")
+    print(f"  BẮT ĐẦU LÀM SẠCH DATASET — {root}")
+    print(f"{'='*72}")
+
+    class_dirs = sorted(d for d in root.iterdir() if d.is_dir()
+                        and not d.name.startswith(("_", "."))
+                        and d.name.lower() != "rejected")
+
+    if not class_dirs:
+        print(f"⚠️  Không tìm thấy lớp nào trong {root}")
+        return []
+
+    for class_dir in class_dirs:
+        class_name = class_dir.name
+        print(f"\n📂 Lớp: {class_name}")
+
+        meta_map = load_metadata_map(class_dir)
+        img_files = sorted(
+            list(class_dir.glob("*.jpg"))
+            + list(class_dir.glob("*.jpeg"))
+            + list(class_dir.glob("*.png"))
+        )
+
+        if not img_files:
+            print(f"   (Không có ảnh)")
             continue
 
-        class_name = class_dir.name
-        print(f"\nĐang quét {class_name}...")
+        class_rejected_dir = rejected / class_name
+        seen_hashes: Set[str] = set()
+        kept_entries:     List[Dict] = []
+        rejected_entries: List[Dict] = []
 
-        for img_file in tqdm(list(class_dir.glob("*.jpg")) + list(class_dir.glob("*.jpeg")) + list(class_dir.glob("*.png")), desc=class_name):
-            is_valid, reason = validate_image_file(img_file)
-            img_hash = compute_image_hash(img_file) if is_valid else None
+        for img_path in tqdm(img_files, desc=f"  Lọc {class_name}"):
+            stats["scanned"] += 1
+            filename = img_path.name
 
-            record = {
-                "class": class_name,
-                "filename": img_file.name,
-                "path": str(img_file),
-                "size_bytes": img_file.stat().st_size,
-                "is_valid": is_valid,
-                "validation_reason": reason,
-                "hash_md5": img_hash,
-                "width": None,
-                "height": None,
-            }
+            try:
+                file_size = img_path.stat().st_size
+            except Exception:
+                file_size = 0
 
-            # Lấy kích thước ảnh
-            if is_valid:
+            # Khởi tạo bản ghi metadata
+            base_meta = meta_map.get(filename, {
+                "filename": filename,
+                "url": "",
+                "query": "",
+                "title": "",
+                "description": "",
+                "source": "local",
+            })
+
+            def _reject(reason: str, reason_key: str, extra: Optional[Dict] = None):
+                """Cách ly ảnh và ghi log."""
+                stats["rejected"] += 1
+                stats["reasons"][reason_key] += 1
+                class_rejected_dir.mkdir(parents=True, exist_ok=True)
+                dest = class_rejected_dir / filename
                 try:
-                    with Image.open(img_file) as img:
-                        record["width"], record["height"] = img.size
-                except:
-                    pass
+                    shutil.move(str(img_path), str(dest))
+                except Exception as mv_err:
+                    print(f"    ⚠️  Di chuyển thất bại ({filename}): {mv_err}")
+                entry = {**base_meta, "reject_reason": reason, "size_bytes": file_size}
+                if extra:
+                    entry.update(extra)
+                rejected_entries.append(entry)
 
-            records.append(record)
+            # ── Tầng 0: Xác thực tệp ──────────────────────────────────────
+            is_valid, err_msg = validate_image_file(img_path)
+            if not is_valid:
+                _reject(f"invalid_file: {err_msg}", "invalid_file")
+                filtered_rows.append([filename, f"REJECTED ({err_msg})", 0.0, "N/A"])
+                continue
 
-    df = pd.DataFrame(records)
+            # Đọc kích thước ảnh
+            try:
+                with Image.open(img_path) as _img:
+                    img_w, img_h = _img.size
+            except Exception:
+                img_w, img_h = 0, 0
 
-    # Phát hiện ảnh trùng lặp
-    print("\nĐang phát hiện ảnh trùng lặp...")
-    df["is_duplicate"] = df.groupby("class")["hash_md5"].transform(
-        lambda x: x.duplicated(keep="first")
-    )
+            # ── Tầng 3: MD5 hash — trùng lặp ─────────────────────────────
+            img_hash = compute_md5(img_path)
+            if img_hash and img_hash in seen_hashes:
+                _reject("duplicate_hash", "duplicate_hash",
+                        {"image_hash": img_hash, "width": img_w, "height": img_h})
+                filtered_rows.append([filename, "REJECTED (duplicate)", 0.0, "N/A"])
+                continue
+            if img_hash:
+                seen_hashes.add(img_hash)
 
-    # Loại bỏ ảnh trùng lặp và ảnh lỗi hỏng
-    print("\nĐang dọn dẹp...")
-    removed_count = 0
+            # ── Tầng 1: CLIP — có phải lá lúa? ────────────────────────────
+            is_rice, clip_prob = is_rice_leaf_clip(img_path, threshold=clip_threshold)
+            if not is_rice:
+                _reject("not_rice_leaf", "not_rice_leaf",
+                        {"clip_rice_prob": clip_prob, "width": img_w, "height": img_h})
+                filtered_rows.append([filename, "REJECTED (not rice leaf)", clip_prob, "N/A"])
+                continue
 
-    for idx, row in df[df["is_duplicate"] | ~df["is_valid"]].iterrows():
-        try:
-            Path(row["path"]).unlink()
-            removed_count += 1
-            print(f"  Đã xóa: {row['filename']} ({row['validation_reason']})")
-        except Exception as e:
-            print(f"  Lỗi khi xóa {row['filename']}: {e}")
+            # ── Tầng 2: Phân loại bệnh ────────────────────────────────────
+            disease_label, disease_conf = predict_rice_disease(img_path)
+            if disease_label == "Unknown":
+                _reject("unknown_disease", "unknown_disease",
+                        {"clip_rice_prob": clip_prob, "width": img_w, "height": img_h})
+                filtered_rows.append([filename, "REJECTED (unknown disease)", disease_conf, clip_prob])
+                continue
 
-    # Lưu siêu dữ liệu đã làm sạch
-    df_clean = df[~(df["is_duplicate"] | ~df["is_valid"])].copy()
-    df_clean.to_csv(output_metadata, index=False)
+            # ── Ảnh hợp lệ ────────────────────────────────────────────────
+            stats["kept"] += 1
+            url   = base_meta.get("url", "")
+            query = base_meta.get("query", "")
+            title = base_meta.get("title", "")
 
-    print(f"\n{'='*60}")
-    print(f"Hoàn thành làm sạch:")
-    print(f"  Tổng số: {len(df)}")
-    print(f"  Hợp lệ: {len(df[df['is_valid']])}")
-    print(f"  Đã xóa (lỗi/trùng lặp): {removed_count}")
-    print(f"  Đã lưu tại: {output_metadata}")
-    print(f"{'='*60}")
+            kept_entry = {
+                **base_meta,
+                "image_hash":        img_hash,
+                "width":             img_w,
+                "height":            img_h,
+                "size_bytes":        file_size,
+                "disease_label":     disease_label,
+                "disease_confidence": disease_conf,
+                "clip_rice_prob":    clip_prob,
+            }
+            kept_entries.append(kept_entry)
 
-    return df_clean
+            all_records.append({
+                "class":              class_name,
+                "filename":           filename,
+                "path":               str(img_path),
+                "url":                url,
+                "query":              query,
+                "title":              title,
+                "size_bytes":         file_size,
+                "width":              img_w,
+                "height":             img_h,
+                "hash_md5":           img_hash,
+                "disease_label":      disease_label,
+                "disease_confidence": round(disease_conf, 6),
+                "clip_rice_prob":     round(clip_prob, 6),
+            })
+
+            filtered_rows.append([filename, disease_label, disease_conf, clip_prob])
+
+        # ── Cập nhật metadata.jsonl của lớp ───────────────────────────────
+        meta_path = class_dir / "metadata.jsonl"
+        if kept_entries:
+            with open(meta_path, "w", encoding="utf-8") as f:
+                for entry in kept_entries:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        else:
+            if meta_path.exists():
+                meta_path.unlink()
+
+        # Ghi log ảnh bị loại
+        if rejected_entries:
+            class_rejected_dir.mkdir(parents=True, exist_ok=True)
+            rej_log = class_rejected_dir / "rejected_metadata.jsonl"
+            with open(rej_log, "w", encoding="utf-8") as f:
+                for entry in rejected_entries:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            print(f"   → Đã cách ly {len(rejected_entries)} ảnh vào {class_rejected_dir.relative_to(_PROJECT_ROOT)}")
+
+    # ── Ghi rice_healthy_filtered.csv (khớp filter_rice_images.py) ────────
+    if write_filtered_csv and filtered_rows:
+        CSV_FILTERED.parent.mkdir(parents=True, exist_ok=True)
+        with open(CSV_FILTERED, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["filename", "final_label", "disease_confidence", "clip_rice_prob"])
+            writer.writerows(filtered_rows)
+
+    # ── Ghi _metadata.csv tổng hợp ───────────────────────────────────────
+    if all_records:
+        keys = [
+            "class", "filename", "path", "url", "query", "title",
+            "size_bytes", "width", "height", "hash_md5",
+            "disease_label", "disease_confidence", "clip_rice_prob",
+        ]
+        csv_out.parent.mkdir(parents=True, exist_ok=True)
+        with open(csv_out, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=keys)
+            writer.writeheader()
+            for r in all_records:
+                writer.writerow({k: r.get(k, "") for k in keys})
+
+    # ── Báo cáo tổng kết ─────────────────────────────────────────────────
+    scanned  = stats["scanned"]
+    kept     = stats["kept"]
+    rejected_total = stats["rejected"]
+    pct_kept = (kept / scanned * 100) if scanned else 0
+
+    accepted_csv = sum(1 for row in filtered_rows if not str(row[1]).startswith("REJECTED"))
+    rejected_csv = len(filtered_rows) - accepted_csv
+
+    print(f"\n{'='*72}")
+    print(f"  BÁO CÁO LÀM SẠCH DATASET")
+    print(f"{'-'*72}")
+    print(f"  Tổng ảnh đã quét     : {scanned:>6}")
+    print(f"  Ảnh HỢP LỆ (giữ lại): {kept:>6}  ({pct_kept:.1f}%)")
+    print(f"  Ảnh bị LOẠI (cách ly): {rejected_total:>6}  ({100 - pct_kept:.1f}%)")
+    print(f"\n  Chi tiết lý do loại bỏ:")
+    print(f"    • File lỗi/hỏng       : {stats['reasons']['invalid_file']:>5}")
+    print(f"    • Không phải lá lúa   : {stats['reasons']['not_rice_leaf']:>5}")
+    print(f"    • Trùng lặp MD5       : {stats['reasons']['duplicate_hash']:>5}")
+    print(f"    • Lỗi phân loại bệnh  : {stats['reasons']['unknown_disease']:>5}")
+    print(f"\n  📊 Kết quả: {accepted_csv} ảnh được chấp nhận (là lá lúa), {rejected_csv} ảnh bị loại.")
+    print(f"  ✅ Chi tiết lưu tại {CSV_FILTERED}")
+    if all_records:
+        print(f"  📋 Metadata tổng hợp  : {csv_out}")
+    print(f"  🗑️  Ảnh rác cách ly tại : {rejected}")
+    print(f"{'='*72}\n")
+
+    return all_records
 
 
-def get_class_distribution(metadata_df: pd.DataFrame) -> pd.DataFrame:
-    """Lấy số lượng ảnh của từng lớp phân loại."""
-    return metadata_df["class"].value_counts().to_frame(name="count")
+# ---------------------------------------------------------------------------
+# Thống kê phụ trợ
+# ---------------------------------------------------------------------------
+
+def get_class_distribution(records: List[Dict]) -> Dict[str, int]:
+    """Đếm số ảnh theo từng lớp phân loại."""
+    counts: Dict[str, int] = {}
+    for r in records:
+        cls = r.get("class", "")
+        if cls:
+            counts[cls] = counts.get(cls, 0) + 1
+    return counts
 
 
-def get_image_size_stats(metadata_df: pd.DataFrame) -> pd.DataFrame:
-    """Lấy số liệu thống kê về chiều rộng/chiều cao cho từng lớp phân loại."""
-    return (
-        metadata_df.groupby("class")[["width", "height"]]
-        .agg(["min", "max", "mean", "std"])
-        .round(0)
-    )
+def get_disease_distribution(records: List[Dict]) -> Dict[str, int]:
+    """Đếm số ảnh theo từng nhãn bệnh."""
+    counts: Dict[str, int] = {}
+    for r in records:
+        label = r.get("disease_label", "Unknown")
+        counts[label] = counts.get(label, 0) + 1
+    return counts
 
+
+def get_image_size_stats(records: List[Dict]) -> Dict[str, Dict[str, float]]:
+    """Thống kê kích thước ảnh (min/max/mean) theo từng lớp."""
+    raw: Dict[str, Dict[str, List[int]]] = {}
+    for r in records:
+        cls = r.get("class", "")
+        w, h = r.get("width", 0), r.get("height", 0)
+        if not cls or not w or not h:
+            continue
+        if cls not in raw:
+            raw[cls] = {"w": [], "h": []}
+        raw[cls]["w"].append(w)
+        raw[cls]["h"].append(h)
+
+    report: Dict[str, Dict[str, float]] = {}
+    for cls, data in raw.items():
+        ws, hs = data["w"], data["h"]
+        report[cls] = {
+            "w_min":  min(ws),
+            "w_max":  max(ws),
+            "w_mean": sum(ws) / len(ws),
+            "h_min":  min(hs),
+            "h_max":  max(hs),
+            "h_mean": sum(hs) / len(hs),
+        }
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint CLI
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Làm sạch và xác thực tập dữ liệu")
-    parser.add_argument("--data-root", default="data\\raw")
-    parser.add_argument("--output", default="data\\raw\\_metadata.csv")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Làm sạch dataset ảnh lúa bằng pipeline 2 tầng AI "
+            "(CLIP + Rice-Leaf-Disease)."
+        )
+    )
+    parser.add_argument(
+        "--data-root",
+        default=str(DATA_RAW_DIR),
+        help=f"Thư mục dữ liệu thô (mặc định: {DATA_RAW_DIR})",
+    )
+    parser.add_argument(
+        "--output",
+        default=str(CSV_METADATA),
+        help=f"File CSV tổng hợp (mặc định: {CSV_METADATA})",
+    )
+    parser.add_argument(
+        "--rejected",
+        default=str(DATA_REJECTED_DIR),
+        help=f"Thư mục cách ly ảnh rác (mặc định: {DATA_REJECTED_DIR})",
+    )
+    parser.add_argument(
+        "--clip-threshold",
+        type=float,
+        default=0.4,
+        help="Ngưỡng xác suất CLIP để chấp nhận là lá lúa (mặc định: 0.4)",
+    )
+    parser.add_argument(
+        "--no-filtered-csv",
+        action="store_true",
+        help="Không ghi file rice_healthy_filtered.csv",
+    )
     args = parser.parse_args()
 
-    df = scan_and_clean_dataset(args.data_root, args.output)
-    print("\nPhân bổ lớp dữ liệu:")
-    print(get_class_distribution(df))
-    print("\nThống kê kích thước ảnh:")
-    print(get_image_size_stats(df))
+    records = scan_and_clean_dataset(
+        data_root=args.data_root,
+        output_csv=args.output,
+        rejected_root=args.rejected,
+        clip_threshold=args.clip_threshold,
+        write_filtered_csv=not args.no_filtered_csv,
+    )
 
+    if records:
+        print("📊 Phân bổ theo lớp:")
+        for cls, cnt in get_class_distribution(records).items():
+            print(f"  {cls:<28} {cnt:>5} ảnh")
+
+        print("\n🔬 Phân bổ theo nhãn bệnh:")
+        for label, cnt in get_disease_distribution(records).items():
+            print(f"  {label:<28} {cnt:>5} ảnh")
+
+        print("\n📏 Thống kê kích thước ảnh:")
+        print(f"  {'Lớp':<28} {'Rộng (min/max/mean)':<26} {'Cao (min/max/mean)'}")
+        for cls, s in get_image_size_stats(records).items():
+            w_str = f"{s['w_min']:.0f}/{s['w_max']:.0f}/{s['w_mean']:.0f}"
+            h_str = f"{s['h_min']:.0f}/{s['h_max']:.0f}/{s['h_mean']:.0f}"
+            print(f"  {cls:<28} {w_str:<26} {h_str}")
+    else:
+        print("\n⚠️  Không có ảnh hợp lệ nào trong dataset!")

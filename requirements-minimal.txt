@@ -1,5 +1,0 @@
-selenium
-requests
-pillow
-tqdm
-tenacity
