@@ -216,8 +216,8 @@ def check_image_relevance(
         if pattern.search(text_no_accent):
             return False, f"crop_exclude_{crop_type}: {pattern.pattern}"
 
-    # 3. Kiểm tra tích cực (chỉ trên URL, title, description)
-    positive_raw = f"{decoded_url} {title} {description}".lower()
+    # 3. Kiểm tra từ khóa tích cực (dùng cả query, URL, title, description)
+    positive_raw = f"{decoded_url} {query} {title} {description}".lower()
     positive_text = remove_vietnamese_diacritics(positive_raw)
     positive_patterns = CROP_POSITIVE_PATTERNS.get(crop_type, [])
 

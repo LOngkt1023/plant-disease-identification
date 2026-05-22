@@ -83,13 +83,6 @@ SOURCE_ALIASES: Dict[str, str] = {
     "bing": "bing",
     "bing-images": "bing",
     "bingimages": "bing",
-    "google": "google",
-    "google-images": "google",
-    "googleimages": "google",
-    "ddg": "ddg",
-    "duckduckgo": "ddg",
-    "duckduckgo-images": "ddg",
-    "duckduckgoimages": "ddg",
 }
 
 # ----------------------------------------------------------------------
@@ -269,7 +262,11 @@ def _init_uc_chrome(headless: bool, proxy: Optional[str], ua: str) -> "selenium_
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-blink-features=AutomationControlled")
-        driver = uc.Chrome(options=options, version_main=None)
+        try:
+            driver = uc.Chrome(options=options, version_main=148)
+        except Exception as uc_err:
+            log.debug(f"Thử version_main=148 không thành công ({uc_err}), thử version_main=None")
+            driver = uc.Chrome(options=options, version_main=None)
         log.debug("Khởi tạo undetected_chromedriver thành công")
         return driver
     except Exception as e:
@@ -418,184 +415,8 @@ def fetch_image_urls_with_selenium(
 
 
 # ----------------------------------------------------------------------
-# Fetch URLs từ DuckDuckGo (không cần browser)
+# Fetch từ Bing (đây là nguồn chính duy nhất)
 # ----------------------------------------------------------------------
-def fetch_image_urls_duckduckgo(
-    query: str,
-    max_results: int = 100,
-) -> List[Tuple[str, Dict]]:
-    """Lấy URL ảnh từ DuckDuckGo Images (không cần Selenium).
-
-    Yêu cầu: ``pip install duckduckgo-search``
-    """
-    try:
-        from duckduckgo_search import DDGS
-    except ImportError:
-        log.warning("duckduckgo-search chưa cài – bỏ qua nguồn DDG. "
-                    "Cài bằng: pip install duckduckgo-search")
-        return []
-
-    urls_with_meta: List[Tuple[str, Dict]] = []
-    try:
-        with DDGS() as ddgs:
-            results = list(ddgs.images(
-                keywords=query,
-                max_results=max_results,
-            ))
-        for r in results:
-            img_url = r.get("image", "")
-            if img_url and img_url.startswith("http"):
-                urls_with_meta.append((img_url, {
-                    "source": "duckduckgo",
-                    "query": query,
-                    "timestamp": datetime.now().isoformat(),
-                    "url": img_url,
-                    "title": r.get("title", ""),
-                }))
-        log.info(f"[DDG] Thu được {len(urls_with_meta)} URL cho '{query}'")
-    except Exception as e:
-        log.warning(f"[DDG] Lỗi khi tìm kiếm '{query}': {e}")
-    return urls_with_meta
-
-
-# ----------------------------------------------------------------------
-# Fetch URLs từ Google Images (Selenium)
-# ----------------------------------------------------------------------
-def fetch_image_urls_google(
-    query: str,
-    max_results: int = 100,
-    headless: bool = True,
-    use_proxy: bool = False,
-    browser_manager: Optional[BrowserManager] = None,
-) -> List[Tuple[str, Dict]]:
-    """Lấy URL ảnh từ Google Images qua Selenium."""
-    urls_with_meta: List[Tuple[str, Dict]] = []
-    driver = None
-    own_driver = False
-    try:
-        if browser_manager:
-            driver = browser_manager.get_driver()
-        else:
-            proxy = proxy_pool.get() if use_proxy else None
-            ua = random_ua()
-            driver = _init_uc_chrome(headless, proxy, ua)
-            driver.set_page_load_timeout(30)
-            own_driver = True
-
-        search_url = (
-            f"https://www.google.com/search?q={quote_plus(query)}"
-            f"&tbm=isch&hl=vi&gl=vn"
-        )
-        driver.get(search_url)
-        time.sleep(2)
-
-        # Cuộn trang để tải thêm ảnh
-        last_h = driver.execute_script("return document.body.scrollHeight")
-        for _ in range(15):
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(random.uniform(1.2, 1.8))
-            # Bấm nút "Xem thêm kết quả" nếu có
-            try:
-                for btn_sel in [
-                    "input.mye4qd", "[data-ved] button", "a.frGj1b",
-                ]:
-                    for btn in driver.find_elements(By.CSS_SELECTOR, btn_sel):
-                        if btn.is_displayed() and btn.is_enabled():
-                            btn.click()
-                            time.sleep(1)
-                            break
-            except Exception:
-                pass
-            new_h = driver.execute_script("return document.body.scrollHeight")
-            if new_h == last_h:
-                break
-            last_h = new_h
-
-        # Chiết xuất URL ảnh từ thuộc tính src / data-src của img
-        img_elements = driver.find_elements(By.CSS_SELECTOR, "img.YQ4gaf, img.rg_i")
-        for el in img_elements:
-            if len(urls_with_meta) >= max_results:
-                break
-            try:
-                src = (
-                    el.get_attribute("src")
-                    or el.get_attribute("data-src")
-                    or ""
-                )
-                # Bỏ qua thumbnail base64 nhỏ
-                if src.startswith("http") and len(src) > 80 and "gstatic" not in src:
-                    alt = el.get_attribute("alt") or ""
-                    urls_with_meta.append((src, {
-                        "source": "google",
-                        "query": query,
-                        "timestamp": datetime.now().isoformat(),
-                        "url": src,
-                        "title": alt,
-                    }))
-            except Exception:
-                continue
-
-        # Phương án 2: click thumbnail để lấy URL full-size
-        if len(urls_with_meta) < max_results // 2:
-            thumbnails = driver.find_elements(By.CSS_SELECTOR, "div.bRMDJf img")
-            for thumb in thumbnails[:max_results * 2]:
-                if len(urls_with_meta) >= max_results:
-                    break
-                try:
-                    thumb.click()
-                    time.sleep(0.5)
-                    for sel in ["img.n3VNCb", "img.r48jcc", ".tvh0pb img"]:
-                        for actual in driver.find_elements(By.CSS_SELECTOR, sel):
-                            src = (
-                                actual.get_attribute("src")
-                                or actual.get_attribute("data-src") or ""
-                            )
-                            if src.startswith("http") and len(src) > 80:
-                                alt = actual.get_attribute("alt") or ""
-                                urls_with_meta.append((src, {
-                                    "source": "google_click",
-                                    "query": query,
-                                    "timestamp": datetime.now().isoformat(),
-                                    "url": src,
-                                    "title": alt,
-                                }))
-                                break
-                        else:
-                            continue
-                        break
-                except Exception:
-                    continue
-
-        log.info(f"[Google] Thu được {len(urls_with_meta)} URL cho '{query}'")
-    except Exception as e:
-        log.warning(f"[Google] Lỗi: {e}")
-    finally:
-        if own_driver and driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
-    return urls_with_meta
-
-
-# ----------------------------------------------------------------------
-# Fetch đa nguồn: Bing + Google + DuckDuckGo
-# ----------------------------------------------------------------------
-def _normalize_sources(sources: Optional[List[str]]) -> List[str]:
-    """Chuẩn hoá alias nguồn về tên canonical: bing, google, ddg."""
-    if sources is None:
-        sources = ["bing", "google", "ddg"]
-
-    normalized: List[str] = []
-    for source in sources:
-        key = source.lower().strip().replace("_", "-").replace(" ", "")
-        canonical = SOURCE_ALIASES.get(key, key)
-        if canonical in ("bing", "google", "ddg") and canonical not in normalized:
-            normalized.append(canonical)
-
-    return normalized or ["bing", "google", "ddg"]
-
-
 def fetch_image_urls_multi_source(
     query: str,
     max_results: int = 100,
@@ -604,69 +425,28 @@ def fetch_image_urls_multi_source(
     browser_manager: Optional[BrowserManager] = None,
     sources: Optional[List[str]] = None,
 ) -> List[Tuple[str, Dict]]:
-    """Lấy URL ảnh từ nhiều nguồn tìm kiếm song song, tự động dedup.
+    """Lấy URL ảnh từ nguồn tìm kiếm Bing.
 
     Args:
         query:          Từ khoá tìm kiếm.
-        max_results:    Số URL tối đa mong muốn (mỗi nguồn sẽ cố lấy số này).
+        max_results:    Số URL tối đa mong muốn.
         headless:       Chạy trình duyệt ẩn hay hiện.
-        use_proxy:      Dùng proxy cho browser (Bing/Google).
+        use_proxy:      Dùng proxy cho browser.
         browser_manager: BrowserManager dùng chung (nếu có).
-        sources:        Danh sách nguồn cần dùng.
-                        Hợp lệ: ``'bing'``, ``'google'``, ``'ddg'``.
-                        Mặc định: tất cả 3 nguồn.
+        sources:        Bị bỏ qua (chỉ thu thập từ Bing).
 
     Returns:
-        Danh sách ``(url, metadata_dict)`` không trùng URL.
+        Danh sách ``(url, metadata_dict)`` không trùng URL từ Bing.
     """
-    sources = _normalize_sources(sources)
-
-    all_results: List[Tuple[str, Dict]] = []
-    seen_urls: Set[str] = set()
-
-    def _bing():
-        if "bing" not in sources:
-            return []
-        try:
-            return fetch_image_urls_with_selenium(
-                query, max_results=max_results,
-                headless=headless, use_proxy=use_proxy,
-                browser_manager=browser_manager,
-            )
-        except Exception as e:
-            log.warning(f"[Bing] Lỗi: {e}")
-            return []
-
-    def _google():
-        if "google" not in sources:
-            return []
-        try:
-            return fetch_image_urls_google(
-                query, max_results=max_results,
-                headless=headless, use_proxy=use_proxy,
-                browser_manager=browser_manager,
-            )
-        except Exception as e:
-            log.warning(f"[Google] Lỗi: {e}")
-            return []
-
-    def _ddg():
-        if "ddg" not in sources:
-            return []
-        return fetch_image_urls_duckduckgo(query, max_results=max_results)
-
-    # Đơn giản hoá: chạy tuần tự để tránh xung đột browser
-    for fn in [_ddg, _bing, _google]:       # DDG trước vì không cần browser
-        for url, meta in fn():
-            if url not in seen_urls:
-                seen_urls.add(url)
-                all_results.append((url, meta))
-
-    log.info(
-        f"[Multi-source] Tổng {len(all_results)} URL duy nhất "
-        f"từ nguồn: {', '.join(sources)}"
-    )
-    return all_results
+    try:
+        return fetch_image_urls_with_selenium(
+            query, max_results=max_results,
+            headless=headless, use_proxy=use_proxy,
+            browser_manager=browser_manager,
+        )
+    except Exception as e:
+        log.warning(f"[Bing] Lỗi thu thập URL: {e}")
+        return []
 
 
 # ----------------------------------------------------------------------
@@ -745,7 +525,7 @@ def _validate_image_quality(img: Image.Image, class_name: str = "") -> Tuple[boo
             confidence -= 0.1
 
         confidence = max(0.0, min(1.0, confidence))
-        return confidence >= 0.30, confidence
+        return confidence >= 0.25, confidence
     except Exception:
         return True, 0.5
 
@@ -867,7 +647,7 @@ def crawl_class_stealth(
                 break
             log.info(f"[{class_name}] Query {q_idx+1}/{len(queries)}: '{query}'")
             urls_with_meta = fetch_image_urls_multi_source(
-                query, max_results=max_images * 2,
+                query, max_results=300,   # cố gắng lấy nhiều nhất có thể
                 headless=headless, use_proxy=use_proxy_for_browser,
                 browser_manager=browser_mgr,
                 sources=sources,
@@ -972,7 +752,7 @@ if __name__ == "__main__":
     import argparse
     _show_ethical_warning()
     parser = argparse.ArgumentParser(
-        description="Thu thập ảnh bệnh cây trồng từ nhiều nguồn (Bing, Google, DuckDuckGo)."
+        description="Thu thập ảnh bệnh cây trồng từ nguồn Bing."
     )
     parser.add_argument("--class", dest="class_name",
                         help="Tên lớp cần crawl (bỏ qua để crawl tất cả)")
@@ -987,15 +767,8 @@ if __name__ == "__main__":
     parser.add_argument("--output",
                         default=str(Path(__file__).parent.parent / "data/raw"),
                         help="Thư mục lưu ảnh")
-    parser.add_argument(
-        "--sources", default="bing,google,ddg",
-        help="Nguồn tìm kiếm, phân cách bằng dấu phẩy: bing,google,ddg "
-             "(alias hỗ trợ: bing-images, google-images, duckduckgo)"
-             " (mặc định: tất cả 3 nguồn)",
-    )
     args = parser.parse_args()
-    sources_list = _normalize_sources([s.strip() for s in args.sources.split(",") if s.strip()])
-    log.info(f"Nguồn tìm kiếm đã chọn: {sources_list}")
+    log.info("Nguồn tìm kiếm đã chọn: ['bing']")
     results = crawl_all_stealth(
         output_root=args.output,
         max_images_per_class=args.max,
@@ -1003,7 +776,7 @@ if __name__ == "__main__":
         use_proxy_for_browser=args.use_proxy_browser,
         use_proxy_for_download=args.use_proxy_download,
         download_workers=args.workers,
-        sources=sources_list,
+        sources=None,
     )
     print("\n── Kết quả tổng hợp ──")
     for cls, res in results.items():
