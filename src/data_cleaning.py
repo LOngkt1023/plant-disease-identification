@@ -22,6 +22,14 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
+# Cấu hình UTF-8 cho Windows console để tránh lỗi UnicodeEncodeError
+if sys.platform.startswith("win"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except AttributeError:
+        pass
+
 from PIL import Image
 from tqdm import tqdm
 
@@ -32,9 +40,10 @@ _SRC_DIR = Path(__file__).parent
 _PROJECT_ROOT = _SRC_DIR.parent
 
 DATA_RAW_DIR       = _PROJECT_ROOT / "data" / "raw"
+DATA_PROCESSED_DIR = _PROJECT_ROOT / "data" / "processed"
 DATA_REJECTED_DIR  = _PROJECT_ROOT / "data" / "rejected"
 CSV_FILTERED       = _SRC_DIR / "rice_healthy_filtered.csv"      # khớp filter_rice_images.py
-CSV_METADATA       = DATA_RAW_DIR / "_metadata.csv"
+CSV_METADATA       = DATA_PROCESSED_DIR / "_metadata.csv"
 
 # Nhãn bệnh lúa hỗ trợ (phải khớp với model Rice-Leaf-Disease)
 RICE_DISEASE_LABELS: List[str] = [
@@ -228,24 +237,31 @@ def load_metadata_map(class_dir: Path) -> Dict[str, Dict]:
 
 def scan_and_clean_dataset(
     data_root: Optional[str] = None,
+    processed_root: Optional[str] = None,
     output_csv: Optional[str] = None,
     rejected_root: Optional[str] = None,
     clip_threshold: float = 0.4,
     write_filtered_csv: bool = True,
+    **kwargs
 ) -> List[Dict]:
-    """Quét toàn bộ dataset, áp dụng pipeline 4 tầng và xuất báo cáo CSV.
+    """Quét toàn bộ dataset, áp dụng pipeline 4 tầng và sao chép ảnh sạch sang thư mục processed.
 
     Args:
-        data_root:          Thư mục gốc chứa các lớp ảnh (mặc định: data/raw/).
+        data_root:          Thư mục gốc chứa các lớp ảnh raw (mặc định: data/raw/).
+        processed_root:     Thư mục gốc lưu trữ ảnh sạch đã làm sạch (mặc định: data/processed/).
         output_csv:         Đường dẫn file CSV tổng hợp toàn dataset.
-        rejected_root:      Thư mục cách ly ảnh lỗi (mặc định: data/rejected/).
-        clip_threshold:     Ngưỡng xác suất CLIP để chấp nhận là lá lúa (default 0.4).
+        rejected_root:      Thư mục cách ly nhật ký/ảnh lỗi (mặc định: data/rejected/).
+        clip_threshold:     Ngưỡng xác suất CLIP để xác nhận là lá lúa (default 0.4).
         write_filtered_csv: Có ghi file `rice_healthy_filtered.csv` hay không.
 
     Returns:
         Danh sách các bản ghi của ảnh hợp lệ được giữ lại.
     """
+    if "output_metadata" in kwargs:
+        output_csv = kwargs["output_metadata"]
+
     root = Path(data_root) if data_root else DATA_RAW_DIR
+    processed = Path(processed_root) if processed_root else DATA_PROCESSED_DIR
     rejected = Path(rejected_root) if rejected_root else DATA_REJECTED_DIR
     csv_out = Path(output_csv) if output_csv else CSV_METADATA
 
@@ -255,6 +271,7 @@ def scan_and_clean_dataset(
         if fallback.exists():
             print(f"⚠️  Phát hiện chạy từ thư mục con. Dùng đường dẫn: {fallback}")
             root = fallback
+            processed = Path("..") / processed
             rejected = Path("..") / rejected
             csv_out = Path("..") / csv_out
         else:
@@ -262,6 +279,7 @@ def scan_and_clean_dataset(
                 f"Không tìm thấy thư mục dữ liệu: '{root}'"
             )
 
+    processed.mkdir(parents=True, exist_ok=True)
     rejected.mkdir(parents=True, exist_ok=True)
 
     # Thống kê tổng hợp
@@ -285,11 +303,12 @@ def scan_and_clean_dataset(
 
     print(f"\n{'='*72}")
     print(f"  BẮT ĐẦU LÀM SẠCH DATASET — {root}")
+    print(f"  Ảnh sạch sẽ được sao chép vào — {processed}")
     print(f"{'='*72}")
 
     class_dirs = sorted(d for d in root.iterdir() if d.is_dir()
                         and not d.name.startswith(("_", "."))
-                        and d.name.lower() != "rejected")
+                        and d.name.lower() not in ("rejected", "processed"))
 
     if not class_dirs:
         print(f"⚠️  Không tìm thấy lớp nào trong {root}")
@@ -310,6 +329,7 @@ def scan_and_clean_dataset(
             print(f"   (Không có ảnh)")
             continue
 
+        class_processed_dir = processed / class_name
         class_rejected_dir = rejected / class_name
         seen_hashes: Set[str] = set()
         kept_entries:     List[Dict] = []
@@ -335,15 +355,9 @@ def scan_and_clean_dataset(
             })
 
             def _reject(reason: str, reason_key: str, extra: Optional[Dict] = None):
-                """Cách ly ảnh và ghi log."""
+                """Ghi log ảnh bị loại (KHÔNG di chuyển hay xóa ảnh raw gốc)."""
                 stats["rejected"] += 1
                 stats["reasons"][reason_key] += 1
-                class_rejected_dir.mkdir(parents=True, exist_ok=True)
-                dest = class_rejected_dir / filename
-                try:
-                    shutil.move(str(img_path), str(dest))
-                except Exception as mv_err:
-                    print(f"    ⚠️  Di chuyển thất bại ({filename}): {mv_err}")
                 entry = {**base_meta, "reject_reason": reason, "size_bytes": file_size}
                 if extra:
                     entry.update(extra)
@@ -389,11 +403,18 @@ def scan_and_clean_dataset(
                 filtered_rows.append([filename, "REJECTED (unknown disease)", disease_conf, clip_prob])
                 continue
 
-            # ── Ảnh hợp lệ ────────────────────────────────────────────────
+            # ── Ảnh hợp lệ (sạch) → Tiến hành sao chép sang processed ─────
             stats["kept"] += 1
             url   = base_meta.get("url", "")
             query = base_meta.get("query", "")
             title = base_meta.get("title", "")
+
+            class_processed_dir.mkdir(parents=True, exist_ok=True)
+            dest_img_path = class_processed_dir / filename
+            try:
+                shutil.copy2(str(img_path), str(dest_img_path))
+            except Exception as cp_err:
+                print(f"    ⚠️  Sao chép ảnh sạch thất bại ({filename}): {cp_err}")
 
             kept_entry = {
                 **base_meta,
@@ -410,7 +431,7 @@ def scan_and_clean_dataset(
             all_records.append({
                 "class":              class_name,
                 "filename":           filename,
-                "path":               str(img_path),
+                "path":               str(dest_img_path),
                 "url":                url,
                 "query":              query,
                 "title":              title,
@@ -425,8 +446,8 @@ def scan_and_clean_dataset(
 
             filtered_rows.append([filename, disease_label, disease_conf, clip_prob])
 
-        # ── Cập nhật metadata.jsonl của lớp ───────────────────────────────
-        meta_path = class_dir / "metadata.jsonl"
+        # ── Cập nhật metadata.jsonl của lớp trong thư mục PROCESSED ───────────
+        meta_path = class_processed_dir / "metadata.jsonl"
         if kept_entries:
             with open(meta_path, "w", encoding="utf-8") as f:
                 for entry in kept_entries:
@@ -435,14 +456,19 @@ def scan_and_clean_dataset(
             if meta_path.exists():
                 meta_path.unlink()
 
-        # Ghi log ảnh bị loại
+        # Ghi log ảnh bị loại vào thư mục rejected (không chạm vào raw)
         if rejected_entries:
             class_rejected_dir.mkdir(parents=True, exist_ok=True)
             rej_log = class_rejected_dir / "rejected_metadata.jsonl"
             with open(rej_log, "w", encoding="utf-8") as f:
                 for entry in rejected_entries:
                     f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            print(f"   → Đã cách ly {len(rejected_entries)} ảnh vào {class_rejected_dir.relative_to(_PROJECT_ROOT)}")
+            
+            try:
+                rel_path = class_rejected_dir.relative_to(_PROJECT_ROOT)
+            except ValueError:
+                rel_path = class_rejected_dir
+            print(f"   → Đã ghi nhật ký {len(rejected_entries)} ảnh bị loại vào {rel_path}")
 
     # ── Ghi rice_healthy_filtered.csv (khớp filter_rice_images.py) ────────
     if write_filtered_csv and filtered_rows:
@@ -479,8 +505,8 @@ def scan_and_clean_dataset(
     print(f"  BÁO CÁO LÀM SẠCH DATASET")
     print(f"{'-'*72}")
     print(f"  Tổng ảnh đã quét     : {scanned:>6}")
-    print(f"  Ảnh HỢP LỆ (giữ lại): {kept:>6}  ({pct_kept:.1f}%)")
-    print(f"  Ảnh bị LOẠI (cách ly): {rejected_total:>6}  ({100 - pct_kept:.1f}%)")
+    print(f"  Ảnh HỢP LỆ (được copy): {kept:>6}  ({pct_kept:.1f}%)")
+    print(f"  Ảnh bị LOẠI (giữ raw) : {rejected_total:>6}  ({100 - pct_kept:.1f}%)")
     print(f"\n  Chi tiết lý do loại bỏ:")
     print(f"    • File lỗi/hỏng       : {stats['reasons']['invalid_file']:>5}")
     print(f"    • Không phải lá lúa   : {stats['reasons']['not_rice_leaf']:>5}")
@@ -490,7 +516,7 @@ def scan_and_clean_dataset(
     print(f"  ✅ Chi tiết lưu tại {CSV_FILTERED}")
     if all_records:
         print(f"  📋 Metadata tổng hợp  : {csv_out}")
-    print(f"  🗑️  Ảnh rác cách ly tại : {rejected}")
+    print(f"  🗑️  Nhật ký ảnh loại tại: {rejected}")
     print(f"{'='*72}\n")
 
     return all_records
@@ -553,26 +579,33 @@ def get_image_size_stats(records: List[Dict]) -> Dict[str, Dict[str, float]]:
 def apply_filter_from_csv(
     csv_path: str,
     source_dir: str,
-    rejected_dir: str,
+    processed_dir: Optional[str] = None,
+    rejected_dir: Optional[str] = None,
     dry_run: bool = False,
 ) -> Dict:
     """
     Áp dụng kết quả filter từ CSV:
-    - Move ảnh REJECTED → data/rejected/<class>/
-    - Cập nhật metadata.jsonl (xóa entry ảnh bị loại)
+    - Đọc ảnh từ source_dir (giữ nguyên không đổi)
+    - Copy ảnh ACCEPTED → processed_dir (mặc định tự suy luận nếu không truyền)
+    - Ghi metadata.jsonl mới chứa các ảnh ACCEPTED tại processed_dir
     - In báo cáo thống kê
-
-    CSV có thể có nhiều schema khác nhau → auto-detect cột:
-        filename / file_name / image / path
-        status / decision / label
-        reason / reject_reason
     """
 
     csv_path = Path(csv_path)
     source_dir = Path(source_dir)
-    rejected_dir = Path(rejected_dir)
 
-    rejected_dir.mkdir(parents=True, exist_ok=True)
+    if not processed_dir:
+        # Tự động suy luận thư mục processed nếu không được truyền
+        if "raw" in source_dir.parts:
+            parts = list(source_dir.parts)
+            idx = parts.index("raw")
+            parts[idx] = "processed"
+            processed_dir = Path(*parts)
+        else:
+            processed_dir = source_dir.parent.parent / "processed" / source_dir.name
+
+    processed_dir = Path(processed_dir)
+    processed_dir.mkdir(parents=True, exist_ok=True)
 
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV không tồn tại: {csv_path}")
@@ -580,9 +613,9 @@ def apply_filter_from_csv(
         raise FileNotFoundError(f"Source dir không tồn tại: {source_dir}")
 
     print(f"\n📄 Đang đọc CSV: {csv_path}")
-    print(f"📁 Source: {source_dir}")
-    print(f"🗑️ Rejected: {rejected_dir}")
-    print(f"{'🧪 DRY RUN (không di chuyển file)' if dry_run else '🚀 APPLY CHANGES'}")
+    print(f"📁 Source (Raw): {source_dir}")
+    print(f"✨ Processed (Clean): {processed_dir}")
+    print(f"{'🧪 DRY RUN (không thực hiện sao chép)' if dry_run else '🚀 APPLY CHANGES'}")
 
     # -----------------------------------------------------------------------
     # Detect columns
@@ -641,39 +674,40 @@ def apply_filter_from_csv(
                 accepted_files.add(fname)
 
     # -----------------------------------------------------------------------
-    # Move rejected images
+    # Copy accepted images (preserving source_dir)
     # -----------------------------------------------------------------------
 
-    moved = 0
+    copied = 0
     missing = 0
 
-    for fname in rejected_files:
+    for fname in accepted_files:
         src = source_dir / fname
-        dst = rejected_dir / fname
+        dst = processed_dir / fname
 
         if not src.exists():
             missing += 1
             continue
 
         if dry_run:
-            print(f"[DRY] move {src} → {dst}")
+            print(f"[DRY] copy {src} → {dst}")
         else:
             try:
-                shutil.move(str(src), str(dst))
-                moved += 1
+                shutil.copy2(str(src), str(dst))
+                copied += 1
             except Exception as e:
-                print(f"⚠️ Move lỗi {src}: {e}")
+                print(f"⚠️ Sao chép lỗi {src}: {e}")
 
     # -----------------------------------------------------------------------
-    # Update metadata.jsonl
+    # Update/write metadata.jsonl in processed_dir
     # -----------------------------------------------------------------------
 
-    meta_path = source_dir / "metadata.jsonl"
+    meta_path_src = source_dir / "metadata.jsonl"
+    meta_path_dst = processed_dir / "metadata.jsonl"
     kept_entries = []
     removed_entries = 0
 
-    if meta_path.exists():
-        with open(meta_path, "r", encoding="utf-8") as f:
+    if meta_path_src.exists():
+        with open(meta_path_src, "r", encoding="utf-8") as f:
             for line in f:
                 try:
                     entry = json.loads(line)
@@ -686,7 +720,7 @@ def apply_filter_from_csv(
                     continue
 
         if not dry_run:
-            with open(meta_path, "w", encoding="utf-8") as f:
+            with open(meta_path_dst, "w", encoding="utf-8") as f:
                 for entry in kept_entries:
                     f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
@@ -703,9 +737,10 @@ def apply_filter_from_csv(
     print(f"Accepted        : {len(accepted_files)}")
     print(f"Rejected        : {len(rejected_files)}")
     print(f"Accept rate     : {accept_rate:.2%}")
-    print(f"Moved           : {moved}")
+    print(f"Copied          : {copied}")
     print(f"Missing file    : {missing}")
-    print(f"Metadata removed: {removed_entries}")
+    print(f"Metadata kept   : {len(kept_entries)}")
+    print(f"Metadata filtered: {removed_entries}")
 
     if reject_reasons:
         print("\nTop reject reasons:")
@@ -718,8 +753,9 @@ def apply_filter_from_csv(
         "accepted": len(accepted_files),
         "rejected": len(rejected_files),
         "accept_rate": accept_rate,
-        "moved": moved,
+        "copied": copied,
         "missing": missing,
+        "metadata_kept": len(kept_entries),
         "metadata_removed": removed_entries,
         "reasons": reject_reasons,
         "dry_run": dry_run,
@@ -745,7 +781,7 @@ if __name__ == "__main__":
 
     parser_filter = subparsers.add_parser(
         "apply-filter",
-        help="Áp dụng CSV filter → move rejected + update metadata"
+        help="Áp dụng CSV filter → copy accepted to processed"
     )
 
     parser_filter.add_argument(
@@ -755,18 +791,23 @@ if __name__ == "__main__":
 
     parser_filter.add_argument(
         "--source", required=True,
-        help="Thư mục nguồn (vd: data/raw/Rice_Healthy)"
+        help="Thư mục nguồn chứa ảnh raw (vd: data/raw/Rice_Healthy)"
     )
 
     parser_filter.add_argument(
-        "--rejected", required=True,
-        help="Thư mục rejected (vd: data/rejected/Rice_Healthy)"
+        "--processed", required=False,
+        help="Thư mục processed chứa ảnh sạch (vd: data/processed/Rice_Healthy)"
+    )
+
+    parser_filter.add_argument(
+        "--rejected", required=False,
+        help="Thư mục rejected (Không còn dùng để di chuyển ảnh, chỉ để tương thích ngược)"
     )
 
     parser_filter.add_argument(
         "--dry-run",
         action="store_true",
-        help="Chỉ preview, không di chuyển file"
+        help="Chỉ preview, không thực hiện sao chép"
     )
 
     # -----------------------------------------------------------------------
@@ -779,6 +820,7 @@ if __name__ == "__main__":
         apply_filter_from_csv(
             csv_path=args.csv,
             source_dir=args.source,
+            processed_dir=args.processed,
             rejected_dir=args.rejected,
             dry_run=args.dry_run,
         )
