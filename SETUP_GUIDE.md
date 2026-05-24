@@ -87,11 +87,11 @@ Expected: `✓ All imports OK!`
 
 ```powershell
 # Phase 1-2: Scrape images (50 per class test)
-python src/crawler_pure_python.py --max 50
+python scripts/crawl.py --max-images-per-class 50
 
 # Phase 3: Check downloaded images
-dir data\raw\Rice_Healthy\
-dir data\raw\Coffee_Healthy\
+dir dataset_v2\raw\Rice_Healthy\
+dir dataset_v2\raw\Tomato_EarlyBlight\
 ```
 
 **If Phase 1-2 works, we'll add:**

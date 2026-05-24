@@ -14,7 +14,36 @@ Kết quả:
 """
 
 import csv
-from .utils import compute_md5
+try:
+    from .utils import compute_md5
+    from .config import (
+        DATA_RAW_DIR,
+        DATA_CLEAN_DIR,
+        DATA_REJECTED_DIR,
+        DATA_REVIEW_DIR,
+        METADATA_DIR,
+        CLEAN_METADATA_CSV,
+        CRAWL_LOG_CSV,
+        CLIP_KEEP_THRESHOLD,
+        CLIP_REVIEW_THRESHOLD,
+        DISEASE_KEEP_THRESHOLD,
+        DISEASE_REVIEW_THRESHOLD,
+    )
+except (ImportError, ValueError):
+    from utils import compute_md5
+    from config import (
+        DATA_RAW_DIR,
+        DATA_CLEAN_DIR,
+        DATA_REJECTED_DIR,
+        DATA_REVIEW_DIR,
+        METADATA_DIR,
+        CLEAN_METADATA_CSV,
+        CRAWL_LOG_CSV,
+        CLIP_KEEP_THRESHOLD,
+        CLIP_REVIEW_THRESHOLD,
+        DISEASE_KEEP_THRESHOLD,
+        DISEASE_REVIEW_THRESHOLD,
+    )
 import json
 import os
 import shutil
@@ -39,11 +68,8 @@ from tqdm import tqdm
 _SRC_DIR = Path(__file__).parent
 _PROJECT_ROOT = _SRC_DIR.parent
 
-DATA_RAW_DIR       = _PROJECT_ROOT / "data" / "raw"
-DATA_PROCESSED_DIR = _PROJECT_ROOT / "data" / "processed"
-DATA_REJECTED_DIR  = _PROJECT_ROOT / "data" / "rejected"
-CSV_FILTERED       = _SRC_DIR / "rice_healthy_filtered.csv"      # khớp filter_rice_images.py
-CSV_METADATA       = DATA_PROCESSED_DIR / "_metadata.csv"
+CSV_FILTERED       = METADATA_DIR / "filter_result.csv"
+CSV_METADATA       = CLEAN_METADATA_CSV
 
 # Nhãn bệnh lúa hỗ trợ (phải khớp với model Rice-Leaf-Disease)
 RICE_DISEASE_LABELS: List[str] = [
@@ -240,7 +266,11 @@ def scan_and_clean_dataset(
     processed_root: Optional[str] = None,
     output_csv: Optional[str] = None,
     rejected_root: Optional[str] = None,
-    clip_threshold: float = 0.4,
+    review_root: Optional[str] = None,
+    clip_keep_threshold: float = CLIP_KEEP_THRESHOLD,
+    clip_review_threshold: float = CLIP_REVIEW_THRESHOLD,
+    disease_keep_threshold: float = DISEASE_KEEP_THRESHOLD,
+    disease_review_threshold: float = DISEASE_REVIEW_THRESHOLD,
     write_filtered_csv: bool = True,
     **kwargs
 ) -> List[Dict]:
@@ -261,8 +291,9 @@ def scan_and_clean_dataset(
         output_csv = kwargs["output_metadata"]
 
     root = Path(data_root) if data_root else DATA_RAW_DIR
-    processed = Path(processed_root) if processed_root else DATA_PROCESSED_DIR
+    processed = Path(processed_root) if processed_root else DATA_CLEAN_DIR
     rejected = Path(rejected_root) if rejected_root else DATA_REJECTED_DIR
+    review = Path(review_root) if review_root else DATA_REVIEW_DIR
     csv_out = Path(output_csv) if output_csv else CSV_METADATA
 
     # Tự động điều chỉnh nếu chạy từ bên trong thư mục src/
@@ -273,6 +304,7 @@ def scan_and_clean_dataset(
             root = fallback
             processed = Path("..") / processed
             rejected = Path("..") / rejected
+            review = Path("..") / review
             csv_out = Path("..") / csv_out
         else:
             raise FileNotFoundError(
@@ -281,17 +313,20 @@ def scan_and_clean_dataset(
 
     processed.mkdir(parents=True, exist_ok=True)
     rejected.mkdir(parents=True, exist_ok=True)
+    review.mkdir(parents=True, exist_ok=True)
+    METADATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Thống kê tổng hợp
+    # Thống kê tổng hợp theo 3 mức
     stats = {
-        "scanned":  0,
-        "kept":     0,
+        "scanned": 0,
+        "kept": 0,
+        "review": 0,
         "rejected": 0,
         "reasons": {
-            "invalid_file":    0,
-            "not_rice_leaf":   0,
-            "duplicate_hash":  0,
-            "unknown_disease": 0,
+            "invalid_file": 0,
+            "duplicate_hash": 0,
+            "not_relevant": 0,
+            "low_disease_confidence": 0,
         },
     }
 
@@ -330,9 +365,11 @@ def scan_and_clean_dataset(
             continue
 
         class_processed_dir = processed / class_name
+        class_review_dir = review / class_name
         class_rejected_dir = rejected / class_name
         seen_hashes: Set[str] = set()
-        kept_entries:     List[Dict] = []
+        kept_entries: List[Dict] = []
+        review_entries: List[Dict] = []
         rejected_entries: List[Dict] = []
 
         for img_path in tqdm(img_files, desc=f"  Lọc {class_name}"):
@@ -388,63 +425,97 @@ def scan_and_clean_dataset(
                 seen_hashes.add(img_hash)
 
             # ── Tầng 1: CLIP — có phải lá lúa? ────────────────────────────
-            is_rice, clip_prob = is_rice_leaf_clip(img_path, threshold=clip_threshold)
-            if not is_rice:
-                _reject("not_rice_leaf", "not_rice_leaf",
-                        {"clip_rice_prob": clip_prob, "width": img_w, "height": img_h})
-                filtered_rows.append([filename, "REJECTED (not rice leaf)", clip_prob, "N/A"])
-                continue
+            _, clip_prob = is_rice_leaf_clip(img_path, threshold=clip_review_threshold)
 
             # ── Tầng 2: Phân loại bệnh ────────────────────────────────────
             disease_label, disease_conf = predict_rice_disease(img_path)
-            if disease_label == "Unknown":
-                _reject("unknown_disease", "unknown_disease",
-                        {"clip_rice_prob": clip_prob, "width": img_w, "height": img_h})
-                filtered_rows.append([filename, "REJECTED (unknown disease)", disease_conf, clip_prob])
+
+            if clip_prob < clip_review_threshold:
+                _reject("not_relevant", "not_relevant",
+                        {"clip_rice_prob": clip_prob, "disease_confidence": disease_conf, "width": img_w, "height": img_h})
+                filtered_rows.append([filename, "REJECTED (not relevant)", disease_conf, clip_prob])
                 continue
 
-            # ── Ảnh hợp lệ (sạch) → Tiến hành sao chép sang processed ─────
-            stats["kept"] += 1
-            url   = base_meta.get("url", "")
-            query = base_meta.get("query", "")
-            title = base_meta.get("title", "")
+            # Mức 1 — Giữ chắc chắn
+            if clip_prob > clip_keep_threshold and disease_conf > disease_keep_threshold:
+                stats["kept"] += 1
+                url = base_meta.get("url", "")
+                query = base_meta.get("query", "")
+                title = base_meta.get("title", "")
 
-            class_processed_dir.mkdir(parents=True, exist_ok=True)
-            dest_img_path = class_processed_dir / filename
-            try:
-                shutil.copy2(str(img_path), str(dest_img_path))
-            except Exception as cp_err:
-                print(f"    ⚠️  Sao chép ảnh sạch thất bại ({filename}): {cp_err}")
+                class_processed_dir.mkdir(parents=True, exist_ok=True)
+                dest_img_path = class_processed_dir / filename
+                try:
+                    shutil.copy2(str(img_path), str(dest_img_path))
+                except Exception as cp_err:
+                    print(f"    ⚠️  Sao chép ảnh sạch thất bại ({filename}): {cp_err}")
 
-            kept_entry = {
-                **base_meta,
-                "image_hash":        img_hash,
-                "width":             img_w,
-                "height":            img_h,
-                "size_bytes":        file_size,
-                "disease_label":     disease_label,
-                "disease_confidence": disease_conf,
-                "clip_rice_prob":    clip_prob,
-            }
-            kept_entries.append(kept_entry)
+                kept_entry = {
+                    **base_meta,
+                    "status": "clean",
+                    "image_hash": img_hash,
+                    "width": img_w,
+                    "height": img_h,
+                    "size_bytes": file_size,
+                    "disease_label": disease_label,
+                    "disease_confidence": disease_conf,
+                    "clip_rice_prob": clip_prob,
+                }
+                kept_entries.append(kept_entry)
 
-            all_records.append({
-                "class":              class_name,
-                "filename":           filename,
-                "path":               str(dest_img_path),
-                "url":                url,
-                "query":              query,
-                "title":              title,
-                "size_bytes":         file_size,
-                "width":              img_w,
-                "height":             img_h,
-                "hash_md5":           img_hash,
-                "disease_label":      disease_label,
-                "disease_confidence": round(disease_conf, 6),
-                "clip_rice_prob":     round(clip_prob, 6),
-            })
+                all_records.append({
+                    "class": class_name,
+                    "filename": filename,
+                    "path": str(dest_img_path),
+                    "url": url,
+                    "query": query,
+                    "title": title,
+                    "size_bytes": file_size,
+                    "width": img_w,
+                    "height": img_h,
+                    "hash_md5": img_hash,
+                    "disease_label": disease_label,
+                    "disease_confidence": round(disease_conf, 6),
+                    "clip_rice_prob": round(clip_prob, 6),
+                    "status": "clean",
+                })
 
-            filtered_rows.append([filename, disease_label, disease_conf, clip_prob])
+                filtered_rows.append([filename, disease_label, disease_conf, clip_prob])
+                continue
+
+            # Mức 2 — Nghi ngờ (đưa vào review)
+            in_review_band = (
+                (clip_review_threshold <= clip_prob <= clip_keep_threshold)
+                or (disease_review_threshold <= disease_conf <= disease_keep_threshold)
+            )
+            if in_review_band:
+                stats["review"] += 1
+                class_review_dir.mkdir(parents=True, exist_ok=True)
+                review_img_path = class_review_dir / filename
+                try:
+                    shutil.copy2(str(img_path), str(review_img_path))
+                except Exception as cp_err:
+                    print(f"    ⚠️  Sao chép ảnh review thất bại ({filename}): {cp_err}")
+
+                review_entry = {
+                    **base_meta,
+                    "status": "review",
+                    "image_hash": img_hash,
+                    "width": img_w,
+                    "height": img_h,
+                    "size_bytes": file_size,
+                    "disease_label": disease_label,
+                    "disease_confidence": disease_conf,
+                    "clip_rice_prob": clip_prob,
+                }
+                review_entries.append(review_entry)
+                filtered_rows.append([filename, "REVIEW", disease_conf, clip_prob])
+                continue
+
+            # Mức 3 — Loại
+            _reject("low_disease_confidence", "low_disease_confidence",
+                    {"clip_rice_prob": clip_prob, "disease_confidence": disease_conf, "width": img_w, "height": img_h})
+            filtered_rows.append([filename, "REJECTED (low confidence)", disease_conf, clip_prob])
 
         # ── Cập nhật metadata.jsonl của lớp trong thư mục PROCESSED ───────────
         meta_path = class_processed_dir / "metadata.jsonl"
@@ -455,6 +526,14 @@ def scan_and_clean_dataset(
         else:
             if meta_path.exists():
                 meta_path.unlink()
+
+        # Ghi log ảnh review
+        if review_entries:
+            class_review_dir.mkdir(parents=True, exist_ok=True)
+            review_log = class_review_dir / "review_metadata.jsonl"
+            with open(review_log, "w", encoding="utf-8") as f:
+                for entry in review_entries:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
         # Ghi log ảnh bị loại vào thư mục rejected (không chạm vào raw)
         if rejected_entries:
@@ -504,20 +583,48 @@ def scan_and_clean_dataset(
     print(f"\n{'='*72}")
     print(f"  BÁO CÁO LÀM SẠCH DATASET")
     print(f"{'-'*72}")
-    print(f"  Tổng ảnh đã quét     : {scanned:>6}")
-    print(f"  Ảnh HỢP LỆ (được copy): {kept:>6}  ({pct_kept:.1f}%)")
-    print(f"  Ảnh bị LOẠI (giữ raw) : {rejected_total:>6}  ({100 - pct_kept:.1f}%)")
+    review_total = stats["review"]
+    print(f"  Số ảnh crawl thô      : {scanned:>6}")
+    print(f"  Số ảnh giữ lại (clean): {kept:>6}")
+    print(f"  Số ảnh nghi ngờ(review): {review_total:>5}")
+    print(f"  Số ảnh loại           : {rejected_total:>6}")
     print(f"\n  Chi tiết lý do loại bỏ:")
-    print(f"    • File lỗi/hỏng       : {stats['reasons']['invalid_file']:>5}")
-    print(f"    • Không phải lá lúa   : {stats['reasons']['not_rice_leaf']:>5}")
-    print(f"    • Trùng lặp MD5       : {stats['reasons']['duplicate_hash']:>5}")
-    print(f"    • Lỗi phân loại bệnh  : {stats['reasons']['unknown_disease']:>5}")
-    print(f"\n  📊 Kết quả: {accepted_csv} ảnh được chấp nhận (là lá lúa), {rejected_csv} ảnh bị loại.")
+    print(f"    • Số ảnh lỗi        : {stats['reasons']['invalid_file']:>5}")
+    print(f"    • Số ảnh trùng      : {stats['reasons']['duplicate_hash']:>5}")
+    print(f"    • Số ảnh không liên quan: {stats['reasons']['not_relevant']:>5}")
+    print(f"    • Số ảnh confidence thấp: {stats['reasons']['low_disease_confidence']:>5}")
+    print(f"\n  📊 Kết quả: clean={kept}, review={review_total}, rejected={rejected_total}")
     print(f"  ✅ Chi tiết lưu tại {CSV_FILTERED}")
     if all_records:
-        print(f"  📋 Metadata tổng hợp  : {csv_out}")
-    print(f"  🗑️  Nhật ký ảnh loại tại: {rejected}")
+        print(f"  📋 Metadata clean     : {csv_out}")
+    print(f"  🔍 Nhật ký review tại : {review}")
+    print(f"  🗑️  Nhật ký reject tại : {rejected}")
     print(f"{'='*72}\n")
+
+    # Ghi log tổng hợp cho báo cáo
+    with open(CRAWL_LOG_CSV, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "raw_crawled",
+                "invalid_files",
+                "duplicate_images",
+                "irrelevant_images",
+                "clean_kept",
+                "review_count",
+                "rejected_total",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow({
+            "raw_crawled": scanned,
+            "invalid_files": stats["reasons"]["invalid_file"],
+            "duplicate_images": stats["reasons"]["duplicate_hash"],
+            "irrelevant_images": stats["reasons"]["not_relevant"],
+            "clean_kept": kept,
+            "review_count": stats["review"],
+            "rejected_total": rejected_total,
+        })
 
     return all_records
 

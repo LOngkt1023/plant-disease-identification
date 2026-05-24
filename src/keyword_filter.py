@@ -75,74 +75,52 @@ EXCLUDE_KEYWORDS: Dict[str, List[str]] = {
 CROP_POSITIVE_KEYWORDS: Dict[str, List[str]] = {
     "Rice": [
         "rice", "oryza", "paddy", "lúa", "稻", "ข้าว", "straw",
-        "blast", "blight", "bacterial", "magnaporthe", "xanthomonas", "pyricularia", "lesion",
-        "leaf", "foliage", "macro", "close-up", "closeup", "detail"
-    ],
-    "Coffee": [
-        "coffee", "coffea", "cà phê", "咖啡", "กาแฟ", "cafe", "coffe",
-        "rust", "hemileia", "leaf rust", "orange spots", "rust fungus",
-        "gỉ sắt", "gi sat", "rỉ sắt", "ri sat", "สนิมใบ", "铁皮病", "叶锈病", "lesion",
+        "blast", "blight", "brown spot", "lesion", "healthy",
         "leaf", "foliage", "macro", "close-up", "closeup", "detail"
     ],
     "Tomato": [
         "tomato", "lycopersicum", "cà chua", "番茄", "西红柿", "มะเขือเทศ",
-        "blight", "curl", "curled", "curling", "phytophthora", "infestans",
-        "tylcv", "yellow leaf curl", "yellowing", "xoăn lá", "xoan la",
-        "sương mai", "suong mai", "卷叶", "黄化卷叶", "ม้วนใบ", "晚疫病", "疫病",
-        "โรคหนาวเย็น", "lesion",
+        "blight", "early blight", "late blight", "leaf mold", "septoria", "healthy",
         "leaf", "foliage", "macro", "close-up", "closeup", "detail"
     ],
-    "Citrus": [
-        "citrus", "orange", "lemon", "lime", "mandarin", "tangerine",
-        "cam", "quýt", "quyt", "chanh", "ส้ม", "มะนาว",
-        "canker", "greening", "hlb", "huanglongbing", "xanthomonas", "citri",
-        "spots", "mottled", "asymmetric yellowing", "loét", "loet",
-        "vàng lá gân xanh", "vang la gan xanh", "vang la hlb",
-        "溃疡病", "黄龙病", "แผลสะดือ", "ใบแก้ว", "โรคเหลือง", "lesion",
+    "Potato": [
+        "potato", "solanum", "khoai tây", "khoai tay",
+        "early blight", "late blight", "healthy",
+        "leaf", "foliage", "macro", "close-up", "closeup", "detail"
+    ],
+    "Corn": [
+        "corn", "maize", "ngô", "bắp", "bap",
+        "rust", "common rust", "northern leaf blight", "healthy",
+        "leaf", "foliage", "macro", "close-up", "closeup", "detail"
+    ],
+    "Apple": [
+        "apple", "malus", "táo", "tao",
+        "scab", "healthy",
         "leaf", "foliage", "macro", "close-up", "closeup", "detail"
     ]
 }
 
-# Từ khóa loại trừ chéo giữa các họ cây trồng (giữ nguyên)
+# Từ khóa loại trừ chéo giữa các họ cây trồng (đã cập nhật cho Rice, Tomato, Potato, Corn, Apple)
 CROP_EXCLUDE_PLANTS: Dict[str, List[str]] = {
     "Rice": [
-        "corn", "maize", "zea_mays", "wheat", "barley", "oat", "rye", "coffee", "coffea",
-        "tomato", "citrus", "orange", "lemon", "lime", "cacao", "cocoa", "potato", "pepper",
-        "eggplant", "cucumber", "melon", "bean", "spinach", "lettuce", "cabbage", "kale",
-        "cannabis", "marijuana", "hemp", "fern", "mimosa", "grape", "rose", "tulip",
-        "hydrangea", "lavender", "cassava", "raspberry", "tea", "radish", "hosta", "maple",
-        "clover", "banana", "oak", "pine", "palm", "bamboo", "grass", "weed", "basil",
-        "mint", "strawberry", "apple", "pear", "peach", "plum", "cherry", "berry",
-        "ginger", "garlic", "onion", "bina", "cải", "chuối", "cần sa"
-    ],
-    "Coffee": [
-        "rice", "oryza", "paddy", "lúa", "corn", "maize", "wheat", "barley", "tomato",
-        "citrus", "orange", "lemon", "lime", "cacao", "cocoa", "potato", "pepper",
-        "eggplant", "cucumber", "melon", "bean", "spinach", "lettuce", "cabbage", "kale",
-        "cannabis", "marijuana", "hemp", "fern", "mimosa", "grape", "rose", "tulip",
-        "hydrangea", "lavender", "cassava", "raspberry", "tea", "radish", "hosta", "maple",
-        "clover", "banana", "oak", "pine", "palm", "bamboo", "grass", "weed", "basil",
-        "mint", "strawberry", "apple", "pear", "peach", "plum", "cherry", "berry",
-        "ginger", "garlic", "onion"
+        "corn", "maize", "potato", "tomato", "apple", "wheat", "barley", "coffee", "citrus",
+        "orange", "lemon", "banana", "grape", "rose", "tulip", "cabbage", "spinach"
     ],
     "Tomato": [
-        "rice", "oryza", "paddy", "lúa", "corn", "maize", "wheat", "barley", "coffee",
-        "coffea", "citrus", "orange", "lemon", "lime", "cacao", "cocoa", "potato", "pepper",
-        "eggplant", "cucumber", "melon", "bean", "spinach", "lettuce", "cabbage", "kale",
-        "cannabis", "marijuana", "hemp", "fern", "mimosa", "grape", "rose", "tulip",
-        "hydrangea", "lavender", "cassava", "raspberry", "tea", "radish", "hosta", "maple",
-        "clover", "banana", "oak", "pine", "palm", "bamboo", "grass", "weed", "basil",
-        "mint", "strawberry", "apple", "pear", "peach", "plum", "cherry", "berry",
-        "ginger", "garlic", "onion"
+        "rice", "paddy", "corn", "maize", "apple", "coffee", "citrus", "orange", "lemon",
+        "banana", "grape", "rose", "cabbage", "spinach"
     ],
-    "Citrus": [
-        "rice", "oryza", "paddy", "lúa", "corn", "maize", "wheat", "barley", "coffee",
-        "coffea", "tomato", "cacao", "cocoa", "potato", "pepper", "eggplant", "cucumber",
-        "melon", "bean", "spinach", "lettuce", "cabbage", "kale", "cannabis", "marijuana",
-        "hemp", "fern", "mimosa", "grape", "rose", "tulip", "hydrangea", "lavender",
-        "cassava", "raspberry", "tea", "radish", "hosta", "maple", "clover", "banana",
-        "oak", "pine", "palm", "bamboo", "grass", "weed", "basil", "mint", "strawberry",
-        "apple", "pear", "peach", "plum", "cherry", "berry", "ginger", "garlic", "onion"
+    "Potato": [
+        "rice", "paddy", "corn", "maize", "apple", "coffee", "citrus", "orange", "lemon",
+        "banana", "grape", "rose", "cabbage", "spinach"
+    ],
+    "Corn": [
+        "rice", "paddy", "potato", "tomato", "apple", "coffee", "citrus", "orange", "lemon",
+        "banana", "grape", "rose", "cabbage", "spinach"
+    ],
+    "Apple": [
+        "rice", "paddy", "potato", "tomato", "corn", "maize", "coffee", "citrus", "orange",
+        "lemon", "banana", "grape", "rose", "cabbage", "spinach"
     ]
 }
 
@@ -202,7 +180,7 @@ def check_image_relevance(
 
     # Xác định nhóm cây trồng
     crop_type = None
-    for crop in ["Rice", "Coffee", "Tomato", "Citrus"]:
+    for crop in ["Rice", "Tomato", "Potato", "Corn", "Apple"]:
         if class_name.lower().startswith(crop.lower()):
             crop_type = crop
             break

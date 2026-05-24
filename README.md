@@ -1,91 +1,293 @@
 # 🌿 Nhận Dạng Bệnh Cây Trồng (Plant Disease Classification)
 
-> **Mục tiêu:** Quản lý vòng đời dữ liệu học sâu chuyên nghiệp và thiết lập quy trình chuẩn để thu thập dữ liệu, làm sạch và huấn luyện mạng Nơ-ron sâu tự động phân loại các loại bệnh trên cây trồng.
+> **Đề tài:** Xây dựng hệ thống nhận dạng bệnh cây trồng từ ảnh lá sử dụng học sâu (Deep Learning).  
+> Dữ liệu tự crawl từ internet. Huấn luyện tối thiểu 2 mô hình (ResNet50 & MobileNetV2).  
+> Báo cáo tiểu luận tối thiểu 35 trang.
 
 ---
 
-## 🚀 Các Tính Năng Nổi Bật
-- **Hệ Thống Crawler Anti-Bot:** Thu thập dữ liệu thông minh trên diện rộng sử dụng các cơ chế bypass anti-bot, rotate proxies và mô phỏng trình duyệt (`crawler_stealth.py`, `proxy.py`, `search_profiles.py`).
-- **Data Pipeline Chuyên Sâu:** Tự động hoá xử lý rác dữ liệu: phân giải URL, xoá trùng lặp, dùng dải phân vị loại bỏ file dị thường, xử lý siêu dữ liệu metadata lỗi (`convert_metadata.py`, `filter_metadata.py`, `keyword_filter.py`, `data_cleaning.py`).
-- **Trung Tâm Deep Learning:** Các pipeline chuyển từ quá trình tiền xử lý ảnh và dán nhãn (`preprocessing.py`) sang kiến trúc mạng tối ưu cho Transfer Learning với thư viện PyTorch (`models.py`).
+## 🎯 Mục Tiêu Dự Án
+
+- Tự crawl >10.000 ảnh bệnh cây từ Google Images
+- Làm sạch và gán nhãn theo **16 lớp** cây trồng / bệnh cây
+- Huấn luyện **ResNet50** và **MobileNetV2** bằng Transfer Learning
+- Đạt **Test Accuracy ≥ 85%**
+- Xuất báo cáo đầy đủ: confusion matrix, classification report, loss/accuracy curve
 
 ---
 
-## 📂 Kiến Trúc Dự Án (Project Structure)
+## 🗂️ Bộ 16 Class
 
-Dự án được phân cấp rõ ràng giữa khu vực nghiên cứu/thử nghiệm (Notebooks), mã nguồn hệ thống sản xuất (Scripts), và kho lưu trữ vật lý (Data/Models):
+| Class | Cây | Bệnh |
+|---|---|---|
+| Rice_Healthy | Lúa | Khỏe mạnh |
+| Rice_LeafBlast | Lúa | Đạo ôn lá |
+| Rice_BrownSpot | Lúa | Đốm nâu |
+| Tomato_Healthy | Cà chua | Khỏe mạnh |
+| Tomato_EarlyBlight | Cà chua | Cháy lá sớm |
+| Tomato_LateBlight | Cà chua | Mốc sương |
+| Tomato_LeafMold | Cà chua | Mốc lá |
+| Tomato_SeptoriaLeafSpot | Cà chua | Đốm lá Septoria |
+| Potato_Healthy | Khoai tây | Khỏe mạnh |
+| Potato_EarlyBlight | Khoai tây | Cháy lá sớm |
+| Potato_LateBlight | Khoai tây | Mốc sương |
+| Corn_Healthy | Ngô | Khỏe mạnh |
+| Corn_CommonRust | Ngô | Gỉ sắt phổ thông |
+| Corn_NorthernLeafBlight | Ngô | Cháy lá phía bắc |
+| Apple_Healthy | Táo | Khỏe mạnh |
+| Apple_Scab | Táo | Bệnh ghẻ lá |
+
+---
+
+## 📂 Cấu Trúc Dự Án
 
 ```text
 plant-disease-identification/
+├── dataset_v2/                       # Dataset phiên bản 2 (16 class)
+│   ├── raw/{class_name}/             # Ảnh thô từ crawl
+│   ├── clean/{class_name}/           # Ảnh sạch qua filter
+│   ├── review/{class_name}/          # Ảnh nghi ngờ, cần review thủ công
+│   ├── rejected/{class_name}/        # Ảnh bị loại
+│   ├── processed/{class_name}/       # Ảnh đã resize 224x224
+│   ├── splits/
+│   │   ├── train/{class_name}/       # 70% train
+│   │   ├── val/{class_name}/         # 15% validation
+│   │   └── test/{class_name}/        # 15% test
+│   ├── metadata/
+│   │   ├── raw_metadata.parquet
+│   │   ├── clean_metadata.parquet
+│   │   ├── split_metadata.parquet
+│   │   └── crawl_summary.csv
+│   └── features/
+│       ├── resnet50_features.npy
+│       ├── resnet50_metadata.csv
+│       ├── mobilenet_v2_features.npy
+│       └── mobilenet_v2_metadata.csv
 │
-├── data/                           # 📁 Kho dữ liệu được quản lý theo luồng
-│   ├── raw/                        # Dữ liệu ảnh thô tải từ mạng về
-│   ├── processed/                  # Dữ liệu ảnh sạch sau khi lọc rác & làm chuẩn
-│   └── augmented/                  # Dữ liệu đã được Data Augmentation
+├── src/
+│   ├── config/
+│   │   └── disease_classes.py        # ⭐ Config trung tâm: 16 class, keywords
+│   ├── config.py                     # Paths và settings
+│   ├── dataset.py                    # Dataset & DataLoader
+│   ├── models.py                     # ResNet50, MobileNetV2
+│   ├── preprocessing.py              # Resize, normalize
+│   ├── crawler_stealth.py            # Crawler anti-bot
+│   ├── keyword_filter.py             # Lọc keyword
+│   └── utils.py                      # Helper functions
 │
-├── notebooks/                      # 📁 Tầng Notebook tương tác & thử nghiệm nghiên cứu
-│   ├── 01_data_crawling.ipynb      # Thử nghiệm các bộ cào dữ liệu và proxy
-│   ├── 02_eda_preprocessing.ipynb  # Khám phá EDA, vẽ biểu đồ, thử thuật toán lọc ảnh
-│   └── 03_model_training.ipynb     # Thử nghiệm thiết kế mạng CV và huấn luyện nháp
+├── scripts/
+│   ├── crawl.py                      # Crawl ảnh từ Google Images
+│   ├── preprocess.py                 # Làm sạch + resize ảnh
+│   ├── split_dataset.py              # Tách train/val/test 70/15/15
+│   ├── data_statistics.py            # Thống kê + biểu đồ dữ liệu
+│   ├── extract_features.py           # Trích xuất features + PCA/t-SNE
+│   ├── train.py                      # Train ResNet50 / MobileNetV2
+│   ├── evaluate.py                   # Evaluate trên test set
+│   └── sanity_check.py               # Kiểm tra nhanh toàn bộ pipeline
 │
-├── src/                            # 📁 Tầng Mã Nguồn Lõi (Core Source Code)
-│   ├── config.py                   # Cấu hình chung và siêu tham số mạng (Hyperparams)
-│   ├── crawler_stealth.py          # Bộ crawler chống phát hiện (nodriver/undetected)
-│   ├── search_profiles.py          # Chỉ định từ khóa & các cấu hình trang lấy ảnh
-│   ├── proxy.py                    # Rotate/Quản lý kết nối Proxy & User-agents
-│   ├── convert_metadata.py         # Chuyển đổi định dạng siêu dữ liệu tải về
-│   ├── filter_metadata.py          # Lọc metadata (Bỏ các bản ghi thiếu URL, size)
-│   ├── keyword_filter.py           # Module thuật toán xử lý nhãn và từ khóa sai
-│   ├── data_cleaning.py            # Làm sạch File vật lý (Deduplicate, Outliers IQR)
-│   ├── preprocessing.py            # Resize, Format, Crop ảnh hàng loạt
-│   ├── storage.py                  # Module IO xử lý đọc/ghi ở tốc độ cao
-│   ├── utils.py                    # Helper (hàm logging, timer, check directory)
-│   └── models.py                   # Backbone architectures: ResNet, MobileNet...
+├── notebooks/
+│   ├── 01_data_crawling.ipynb        # Notebook crawl + EDA cơ bản
+│   ├── 02_eda_preprocessing.ipynb    # EDA nâng cao + preprocessing
+│   └── 03_model_training.ipynb       # Training loop + visualize
 │
-├── reports/                        # 📁 Lưu báo cáo và hình ảnh học thuật
-│   ├── evaluation.txt              # Chỉ số F1, Recall, Precision của mạng sâu
+├── outputs/
+│   ├── resnet50/                     # Kết quả train ResNet50
+│   ├── mobilenet_v2/                 # Kết quả train MobileNetV2
+│   ├── data_statistics/              # Biểu đồ thống kê dữ liệu
+│   └── features/                    # PCA/t-SNE plots
 │
-├── requirements.txt                # Thư viện quy chuẩn của dự án (PyTorch, Selenium...)
-├── SETUP_GUIDE.md                  # Hướng dẫn chi tiết setup Môi trường (Conda/venv)
-└── README.md                       # Tài liệu hướng dẫn bộ quy tắc chung
+├── docs/
+│   └── refactor_status.md            # Trạng thái refactor
+├── requirements.txt
+├── SETUP_GUIDE.md
+└── README.md
 ```
 
 ---
 
-## 🛠️ Hướng Dẫn Khởi Chạy (Quick Start)
+## ⚙️ Cài Đặt Môi Trường
 
-### 1. Khởi Tạo Môi Trường Làm Việc
-Vui lòng tham khảo kịch bản lỗi ở `SETUP_GUIDE.md`. Cài đặt nhanh với Minconda (Conda):
 ```bash
 conda create -n crop-disease python=3.11 -y
 conda activate crop-disease
 pip install -r requirements.txt
 ```
 
-### 2. Quy Trình Vận Hành 4 Bước Tiêu Chuẩn (Workflow)
-Sự thành công của mô hình máy học phần lớn ở sự tuân thủ quy trình Sandbox To Production:
-1. **Nghiên Cứu Thử Nghiệm (Notebooks):** Dùng thư mục `notebooks/` để trải nghiệm logic cào ảnh, phân tích trực quan EDA, và kịch bản mạng Neural.
-2. **Triển Khai Hoàn Thiện (Src/):** Đoạn mã chạy ngon trên Notebook sẽ được đúc kết thành các Class & Function để bỏ vào `src/` theo đúng chức trách.
-3. **Thực Thi Công Đoạn Dữ Liệu:**
-   - **Crawling:** `python src/crawler_stealth.py` -> Đưa ảnh về `data/raw/`
-   - **Làm Sạch (Filtering):** `python src/data_cleaning.py` kết hợp các module Metadata -> `data/processed/`.
-   - **Chống Dị Biến (Preprocessing):** Cân bằng kích cỡ qua `src/preprocessing.py`.
-4. **Bắt Đầu Huấn Luyện (Training):** 
-   - Tiến hành thiết lập trong `src/config.py` và chạy kiến trúc tại `src/models.py`. Có thể phân tán Train Script hoặc Jupyter cho Server GPU. Nhận báo cáo thành tích vào `reports/`.
+---
+
+## 🔄 Pipeline Đầy Đủ
+
+### 1. Crawl Dữ Liệu
+
+```bash
+# Crawl thử (20 ảnh/class)
+python scripts/crawl.py --max-images-per-class 20
+
+# Crawl thật (1500 ảnh/class → ~24.000 ảnh thô)
+python scripts/crawl.py --max-images-per-class 1500
+```
+
+Ảnh được lưu vào: `dataset_v2/raw/{class_name}/`
+
+### 2. Làm Sạch & Preprocess
+
+```bash
+python scripts/preprocess.py
+```
+
+Output:
+- `dataset_v2/clean/` — ảnh hợp lệ
+- `dataset_v2/review/` — ảnh nghi ngờ
+- `dataset_v2/rejected/` — ảnh bị loại
+
+Threshold:
+- `clip_score >= 0.60` → clean
+- `0.35 <= clip_score < 0.60` → review
+- `clip_score < 0.35` → rejected
+
+### 3. Chia Tập Train/Val/Test
+
+```bash
+python scripts/split_dataset.py
+```
+
+Tỷ lệ: 70% Train / 15% Val / 15% Test — stratified split theo class.
+
+Output: `dataset_v2/splits/train|val|test/{class_name}/`
+
+### 4. Thống Kê Dữ Liệu
+
+```bash
+python scripts/data_statistics.py
+```
+
+Output vào `outputs/data_statistics/`:
+- `class_distribution.png`
+- `plant_distribution.png`
+- `disease_distribution.png`
+- `status_distribution.png`
+- `source_domain_distribution.png`
+- `keyword_distribution.png`
+- `image_size_distribution.png`
+- `data_summary.csv`
+
+### 5. Trích Xuất Features
+
+```bash
+python scripts/extract_features.py --model resnet50
+python scripts/extract_features.py --model mobilenet_v2
+```
+
+Output vào `dataset_v2/features/`:
+- `resnet50_features.npy` / `resnet50_metadata.csv`
+- `mobilenet_v2_features.npy` / `mobilenet_v2_metadata.csv`
+
+Plots vào `outputs/features/`:
+- `resnet50_pca.png`, `resnet50_tsne.png`
+- `mobilenet_v2_pca.png`, `mobilenet_v2_tsne.png`
+
+### 6. Huấn Luyện Mô Hình
+
+```bash
+# Train ResNet50 (full 30 epoch)
+python scripts/train.py --model resnet50 --epochs 30 --batch-size 32
+
+# Train MobileNetV2
+python scripts/train.py --model mobilenet_v2 --epochs 30 --batch-size 32
+
+# Train nhanh thử (2 epoch)
+python scripts/train.py --model resnet50 --epochs 2 --batch-size 16
+python scripts/train.py --model mobilenet_v2 --epochs 2 --batch-size 16
+```
+
+Output vào `outputs/{model_name}/`:
+- `best_checkpoint.pt`
+- `last_checkpoint.pt`
+- `train_history.csv` / `train_history.json`
+
+### 7. Đánh Giá Mô Hình
+
+```bash
+python scripts/evaluate.py --model resnet50
+python scripts/evaluate.py --model mobilenet_v2
+```
+
+Output vào `outputs/{model_name}/`:
+- `classification_report.txt`
+- `classification_report.csv`
+- `confusion_matrix.png`
+- `predictions.csv`
 
 ---
 
-## 🧭 Cơ Chế Xuyên Thủng Hệ Thống Anti-Bot
-Với lượng lớn dữ liệu (ví dụ 10.000 ảnh/layer), các bộ công cụ thông thường sẽ bị ngắt luồng (Blocked/Rate Limited). Dự án phòng hộ bằng:
-- **Tàng Hình Cấp Độ Trình Duyệt:** Giấu toàn bộ thuộc tính `navigator.webdriver` thông qua `nodriver` hoặc `undetected-chromedriver`.
-- **Hành Vi Sinh Học (Jitter Delays):** Không có cỗ máy nào click chuột cứ 1.5s/lần trọn đời. Bot thêm độ trễ ngẫu nhiên cùng các thao tác scroll ngắt quãng tại `search_profiles.py`.
-- **Địa Chỉ Hoán Đổi Liên Tục:** Thay đổi định tuyến hệ thống mạng Residential thông qua logic cấu hình tại `proxy.py`.
+## ✅ Kết Quả Mong Đợi
+
+| Chỉ số | Mục tiêu |
+|---|---|
+| Tổng ảnh sạch | > 10.000 ảnh |
+| Số class | 16 |
+| Train Accuracy | > 90% |
+| Test Accuracy | **≥ 85%** |
+| F1-score (macro) | > 0.85 |
 
 ---
 
-## 🧹 Triết Lý "Rác Vào, Rác Ra" Và Cách Làm Sạch
-Mọi dòng code ML đều chết đứng nếu Dataset không đạt chuẩn. Bộ lọc trong `data_cleaning.py` áp tiêu chuẩn khắt khe cho từng tấm ảnh:
-1. **Chống Trùng Lặp Cấp Vật Lý (Deduplication):** Cấu thành chuỗi hàm băm (Hash SHA-256) xử tử đối với các URL hoặc content bị lập lại.
-2. **Khuyết Thiếu Răn Đe:** Các records Metadata nếu thiếu link hoặc size sẽ tự động gạch bỏ.
-3. **Khoanh Vùng Outliers Bằng IQR:** Nếu bức hình chỉ có `1KB` hoặc thuộc cỡ Panorama bản trích lục (vượt 1.5 lần dải nội phân vị IQR), nó là rác nhiễu và lập tức bị Drop.
-4. **Hậu Chuẩn Cấu Trúc File:** Tất cả được `Image.open()` (Pillow/OpenCV) giải mã thử. Nghi ngờ hình lỗi/Corrupt sẽ bị Delete vật lý và dọn dẹp khỏi DataFrame. File sau đó cùng thống nhất ép về `*.jpg` cho Data Loader của PyTorch vào việc.
+## 🔍 Kiểm Tra Nhanh (Sanity Check)
+
+```bash
+python scripts/sanity_check.py
+```
+
+Kiểm tra:
+- `NUM_CLASSES == 16`
+- `CLASS_TO_IDX` / `IDX_TO_CLASS` đúng
+- Mỗi class có keywords
+- ResNet50 output shape `[2, 16]`
+- MobileNetV2 output shape `[2, 16]`
+- Không có md5 overlap giữa train/val/test
+- Các file script quan trọng tồn tại
+
+---
+
+## 📌 Lưu Ý Quan Trọng
+
+- **Không hard-code class** rải rác. Tất cả class và keywords được quản lý tại `src/config/disease_classes.py`.
+- Dataset cũ (nếu có) trong `data/` **không bị xóa**. Dataset mới dùng `dataset_v2/`.
+- Không dùng augmentation để tính số lượng crawl gốc.
+- Augmentation chỉ áp dụng trong DataLoader lúc train.
+
+---
+
+## 🏗️ Chiến Lược Fine-tuning
+
+```
+Giai đoạn 1 (3–5 epoch):
+  - Freeze backbone
+  - Chỉ train classifier head
+  - Learning rate: 1e-3
+
+Giai đoạn 2 (25 epoch):
+  - Unfreeze 1–2 block cuối backbone
+  - Fine-tune toàn bộ
+  - Learning rate: 1e-4 → 1e-5 (ReduceLROnPlateau)
+```
+
+---
+
+## 📖 Cấu Trúc Module Chính
+
+| File | Mô tả |
+|---|---|
+| `src/config/disease_classes.py` | ⭐ Config trung tâm: 16 class, keywords, plant/disease info |
+| `src/config.py` | Paths, device, training hyperparameters |
+| `src/models.py` | `get_resnet50()`, `get_mobilenet_v2()`, `build_model()` |
+| `src/dataset.py` | `PlantDiseaseDataset`, DataLoader builders |
+| `src/preprocessing.py` | Resize với padding, normalize theo ImageNet |
+| `scripts/crawl.py` | Crawl ảnh từ Google Images theo keywords |
+| `scripts/preprocess.py` | Lọc ảnh lỗi, resize, tính hash, xuất metadata |
+| `scripts/split_dataset.py` | Stratified split 70/15/15 |
+| `scripts/data_statistics.py` | Thống kê + biểu đồ phân phối dữ liệu |
+| `scripts/extract_features.py` | Deep feature extraction + PCA/t-SNE |
+| `scripts/train.py` | Training loop đầy đủ với checkpoint + history |
+| `scripts/evaluate.py` | Đánh giá test set: F1, confusion matrix, report |
+| `scripts/sanity_check.py` | Kiểm tra nhanh toàn bộ pipeline |

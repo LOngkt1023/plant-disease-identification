@@ -91,18 +91,15 @@ SOURCE_ALIASES: Dict[str, str] = {
 RETRYABLE_EXCEPTIONS = (ConnectionError, TimeoutError, OSError,
                         urllib.error.URLError, urllib.error.HTTPError)
 
-# Các lớp dữ liệu
+# Các lớp dữ liệu — lấy từ config trung tâm, không hard-code
+try:
+    from .config.disease_classes import CLASS_NAMES, PLANT_DISEASE_CLASSES
+except (ImportError, ValueError):
+    from config.disease_classes import CLASS_NAMES, PLANT_DISEASE_CLASSES
+
 DATASET_CLASSES: Dict[str, str] = {
-    "Rice_Healthy": "Lúa khỏe mạnh",
-    "Rice_Blast": "Lúa bệnh đạo ôn",
-    "Rice_Blight": "Lúa bệnh bạc lá",
-    "Coffee_Healthy": "Cà phê khỏe mạnh",
-    "Coffee_Rust": "Cà phê bệnh rỉ sắt",
-    "Tomato_Healthy": "Cà chua khỏe mạnh",
-    "Tomato_Blight": "Cà chua bệnh sương mai",
-    "Tomato_Curl": "Cà chua bệnh xoăn lá",
-    "Citrus_Canker": "Cam bệnh loét",
-    "Citrus_Greening": "Cam bệnh vàng lá",
+    cls: f"{PLANT_DISEASE_CLASSES[cls]['plant']} - {PLANT_DISEASE_CLASSES[cls]['disease']}"
+    for cls in CLASS_NAMES
 }
 
 # Search queries are defined centrally in src/search_profiles.py
@@ -132,7 +129,7 @@ def _should_exclude_url(url: str, query: str, class_name: str) -> bool:
     text_no_accent = remove_vietnamese_diacritics(text)
     # Tìm nhóm cây từ class_name
     crop_group = None
-    for c in ["Rice", "Coffee", "Tomato", "Citrus"]:
+    for c in ["Rice", "Tomato", "Potato", "Corn", "Apple"]:
         if class_name.startswith(c):
             crop_group = c
             break
@@ -720,7 +717,7 @@ def crawl_all_stealth(
     root = Path(output_root)
     for d in [root, root.parent / "processed", root.parent / "augmented"]:
         ensure_dir(str(d))
-    target = classes if classes else list(DATASET_CLASSES.keys())
+    target = classes if classes else list(CLASS_NAMES)
     target = [c for c in target if c in DATASET_CLASSES]
     return {
         c: crawl_class_stealth(
@@ -765,7 +762,7 @@ if __name__ == "__main__":
     parser.add_argument("--use-proxy-download", action="store_true",
                         help="Dùng proxy khi tải ảnh")
     parser.add_argument("--output",
-                        default=str(Path(__file__).parent.parent / "data/raw"),
+                        default=str(Path(__file__).parent.parent / "dataset_v2" / "raw"),
                         help="Thư mục lưu ảnh")
     args = parser.parse_args()
     log.info("Nguồn tìm kiếm đã chọn: ['bing']")
