@@ -670,7 +670,7 @@ def crawl_class_stealth(
             futures = {}
             with ThreadPoolExecutor(max_workers=download_workers) as pool:
                 for url, meta in unique:
-                    tmp_path = class_dir / f"_tmp_download_{random.randint(0,1e9):010d}.jpg"
+                    tmp_path = class_dir / f"_tmp_download_{random.randint(0, int(1e9)):010d}.jpg"
                     futures[pool.submit(download_image, url, tmp_path, 20,
                                         use_proxy_for_download, class_name)] = (meta, tmp_path)
                 for fut in tqdm(as_completed(futures), total=len(futures), desc=class_name):
